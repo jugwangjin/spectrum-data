@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>40×40 spectral viewer</title>
+  <!-- 스펙트럼 바이너리는 gzip+base64로 이 파일에 포함됨. 같은 폴더의 index.html을 file:// 로 열어도 동작. -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 12px; background: #111; color: #eee; }
+    h1 { font-size: 1.1rem; font-weight: 600; }
+    p.hint { font-size: 0.85rem; color: #aaa; max-width: 52rem; }
+    table.grid { border-collapse: collapse; table-layout: fixed; }
+    table.grid td {
+      width: 10px; height: 10px; padding: 0; border: 1px solid #222;
+      cursor: crosshair;
+    }
+    table.grid td:hover { outline: 2px solid #fff; z-index: 1; position: relative; }
+    #popup {
+      display: none; position: fixed; right: 16px; top: 16px; width: min(520px, 92vw);
+      background: #1a1a1a; border: 1px solid #444; border-radius: 8px;
+      padding: 10px; box-shadow: 0 8px 32px rgba(0,0,0,0.6); z-index: 10;
+    }
+    #popup h2 { margin: 0 0 8px; font-size: 0.95rem; }
+    #popup canvas { max-width: 100% !important; height: auto !important; }
+    .legend { font-size: 0.75rem; color: #888; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <h1>40×40 픽셀 — 아래 두 맵은 서로 다른 score / 호버 시 같은 팝업에 스펙트럼 + 최빈 곡선</h1>
+  <p class="hint" id="hint"></p>
+  <h2 style="font-size:0.95rem;margin:12px 0 6px;color:#ccc">ROI 피크·골 prominence score</h2>
+  <table class="grid" id="grid" aria-label="activation map"></table>
+  <h2 style="font-size:0.95rem;margin:16px 0 6px;color:#ccc">RMS vs 파장별 최빈 진폭 곡선 (전 픽셀 히스토그램 모드)</h2>
+  <table class="grid" id="gridModal" aria-label="modal deviation map"></table>
+  <div id="popup">
+    <h2 id="ptitle"></h2>
+    <canvas id="ch" height="280"></canvas>
+    <div class="legend">파란: raw · 주황~옅은: LP · 보라 선+점: 파장별 최빈 진폭(참조) · 빨강/녹: 국소 최대·최소 표시</div>
+  </div>
+
+  <script>
+    const META = __META_JSON__;
+
+    const G = META.grid || 40;
+    const nWl = META.n_wavelength;
+    const wl = META.wavelength;
+    const acts = META.activations;
+    const modalScores = META.modal_deviation_scores || [];
+    const modalCurve = META.modal_amplitude_curve || [];
+    const pixelsMeta = META.pixels;
+    const xIsIndex = META.x_axis === "index";
+
+    function percentile(arr, p) {
+      const s = [...arr].sort((a,b) => a - b);
+      const i = (p / 100) * (s.length - 1);
+      const lo = Math.floor(i), hi = Math.ceil(i);
+      return s[lo] + (i - lo) * (s[hi] - s[lo] || 0);
+    }
+    const aLo = percentile(acts, 5), aHi = percentile(acts, 95);
+    function actColor(a) {
+      const t = Math.max(0, Math.min(1, (a - aLo) / (aHi - aLo || 1)));
+      const r = Math.round(255 * t);
+      const g = Math.round(255 * (1 - Math.abs(t - 0.5) * 2));
+      const b = Math.round(255 * (1 - t));
+      return `rgb(${r},${g},${b})`;
+    }
+
+    const mLo = modalScores.length ? percentile(modalScores, 5) : 0;
+    const mHi = modalScores.length ? percentile(modalScores, 95) : 1;
+    function modalColor(v) {
+      const t = Math.max(0, Math.min(1, (v - mLo) / (mHi - mLo || 1)));
+      const r = Math.round(255 * Math.min(1, t * 1.2));
+      const g = Math.round(255 * (0.2 + 0.5 * (1 - t)));
+      const b = Math.round(255 * (0.35 * (1 - t)));
+      return `rgb(${r},${g},${b})`;
+    }
+
+    let bundleBuf = null;
+    let chartInst = null;
+
+    function pixelOffset(p) {
+      const u32 = new Uint32Array(bundleBuf, 0, 4);
+      const magic = u32[0], nw = u32[1], np = u32[2], nc = u32[3];
+      if (magic !== 0x41555247) throw new Error("bad magic in embedded bundle");
+      const header = 16;
+      const stride = nw * nc * 4;
+      return header + p * stride;
+    }
+
+    function readPixelChannels(p) {
+      const u32 = new Uint32Array(bundleBuf, 0, 4);
+      const nw = u32[1], nc = u32[3];
+      const off = pixelOffset(p);
+      const f32 = new Float32Array(bundleBuf, off, nw * nc);
+      const out = [];
+      for (let c = 0; c < nc; c++) {
+        const col = new Float32Array(nw);
+        for (let i = 0; i < nw; i++) col[i] = f32[i * nc + c];
+        out.push(col);
+      }
+      return out;
+    }
+
+    function xVal(i) {
+      return xIsIndex ? (i + 1) : wl[i];
+    }
+
+    function showPopup(p) {
+      const chans = readPixelChannels(p);
+      const raw = chans[0];
+      const smooths = chans.slice(1);
+      const pm = pixelsMeta[p];
+      const xs = Array.from({length: nWl}, (_, i) => xVal(i));
+
+      const datasets = [];
+
+      if (modalCurve.length === nWl) {
+        const modalPts = xs.map((x, i) => ({ x, y: modalCurve[i] }));
+        datasets.push({
+          type: "line",
+          label: "파장별 최빈 진폭 (line)",
+          data: modalPts,
+          borderColor: "rgba(180,100,255,0.85)",
+          backgroundColor: "transparent",
+          borderWidth: 2,
+          pointRadius: 0,
+          fill: false,
+          order: -10,
+        });
+        datasets.push({
+          type: "scatter",
+          label: "파장별 최빈 진폭 (scatter)",
+          data: modalPts,
+          pointRadius: 3,
+          pointHoverRadius: 4,
+          showLine: false,
+          backgroundColor: "rgba(220,140,255,0.95)",
+          borderColor: "rgba(120,60,180,0.9)",
+          borderWidth: 1,
+          order: -9,
+        });
+      }
+
+      datasets.push({
+        type: "scatter",
+        label: "raw",
+        data: xs.map((x, i) => ({x, y: raw[i]})),
+        pointRadius: 2,
+        pointHoverRadius: 3,
+        showLine: false,
+        backgroundColor: "rgba(0,120,255,0.9)",
+        borderColor: "rgba(0,120,255,0.4)",
+        order: 2,
+      });
+
+      const alphas = [0.45, 0.28, 0.16, 0.09, 0.05];
+      const colors = [
+        "rgba(255,120,0,ALPHA)",
+        "rgba(255,150,60,ALPHA)",
+        "rgba(255,190,120,ALPHA)",
+        "rgba(255,220,180,ALPHA)",
+        "rgba(200,200,200,ALPHA)",
+      ];
+      smooths.forEach((ys, k) => {
+        const a = alphas[k] ?? 0.04;
+        const c = (colors[k] ?? "rgba(180,180,180,ALPHA)").replace("ALPHA", String(a));
+        datasets.push({
+          type: "scatter",
+          label: "LP " + (k + 1),
+          data: xs.map((x, i) => ({x, y: ys[i]})),
+          pointRadius: 2,
+          showLine: false,
+          backgroundColor: c,
+          borderColor: c,
+          order: 3 + k,
+        });
+      });
+
+      const yrng = Math.max(...raw) - Math.min(...raw) || 1;
+      const dy = yrng * 0.07;
+
+      const maxs = pm.clear_maxima || [];
+      if (maxs.length) {
+        const seg = [];
+        for (const v of maxs) {
+          const x = xVal(v.index);
+          const yy = raw[v.index];
+          seg.push({ x, y: yy - dy }, { x, y: yy });
+          seg.push({ x: NaN, y: NaN });
+        }
+        datasets.push({
+          label: "국소 최대 표시",
+          data: seg,
+          type: "line",
+          showLine: true,
+          borderColor: "rgba(255,60,100,0.95)",
+          borderWidth: 2,
+          pointRadius: 0,
+          fill: false,
+          spanGaps: false,
+          order: 20,
+        });
+      }
+
+      const mins = pm.clear_minima || [];
+      if (mins.length) {
+        const seg = [];
+        for (const v of mins) {
+          const x = xVal(v.index);
+          const yy = raw[v.index];
+          seg.push({ x, y: yy + dy }, { x, y: yy });
+          seg.push({ x: NaN, y: NaN });
+        }
+        datasets.push({
+          label: "국소 최소 표시",
+          data: seg,
+          type: "line",
+          showLine: true,
+          borderColor: "rgba(0,220,90,0.95)",
+          borderWidth: 2,
+          pointRadius: 0,
+          fill: false,
+          spanGaps: false,
+          order: 21,
+        });
+      }
+
+      const popup = document.getElementById("popup");
+      const title = document.getElementById("ptitle");
+      const r = Math.floor(p / G), c = p % G;
+      let extra = "";
+      if (pm.peak_primary_nm != null) extra += ` · peak λ≈${pm.peak_primary_nm.toFixed(2)} nm`;
+      if (pm.peak_width_nm != null) extra += ` · peak w≈${pm.peak_width_nm.toFixed(2)} nm`;
+      if (pm.valley_primary_nm != null) extra += ` · valley λ≈${pm.valley_primary_nm.toFixed(2)} nm`;
+      if (pm.valley_width_nm != null) extra += ` · valley w≈${pm.valley_width_nm.toFixed(2)} nm`;
+      const np = pm.n_peaks_roi ?? 0, nv = pm.n_valleys_roi ?? 0;
+      extra += ` · ROI peaks=${np} valleys=${nv}`;
+      const mr = pm.modal_rms;
+      if (mr != null && Number.isFinite(mr)) extra += ` · modal RMS=${mr.toFixed(2)}`;
+      title.textContent = `pixel ${p} (row ${r}, col ${c}) · act score=${(pm.score||0).toFixed(1)}${extra}`;
+
+      popup.style.display = "block";
+      const ctx = document.getElementById("ch").getContext("2d");
+      if (chartInst) chartInst.destroy();
+      chartInst = new Chart(ctx, {
+        data: { datasets },
+        options: {
+          responsive: true,
+          animation: false,
+          scales: {
+            x: {
+              type: "linear",
+              title: { display: true, text: xIsIndex ? "index 1..N" : "wavelength (nm)", color: "#ccc" },
+              ticks: { color: "#aaa", maxTicksLimit: 8 },
+              grid: { color: "#333" },
+            },
+            y: {
+              title: { display: true, text: "amplitude", color: "#ccc" },
+              ticks: { color: "#aaa" },
+              grid: { color: "#333" },
+            },
+          },
+          plugins: {
+            legend: { labels: { color: "#ccc", boxWidth: 10, font: { size: 10 } } },
+          },
+        },
+      });
+    }
+
+    function buildTable() {
+      const tbl = document.getElementById("grid");
+      for (let r = 0; r < G; r++) {
+        const tr = document.createElement("tr");
+        for (let c = 0; c < G; c++) {
+          const p = r * G + c;
+          const td = document.createElement("td");
+          const pm = pixelsMeta[p];
+          let tip = `pixel ${p} · act ${acts[p].toFixed(1)} · ROI p${pm.n_peaks_roi ?? 0} v${pm.n_valleys_roi ?? 0}`;
+          if (pm.modal_rms != null) tip += ` · modalRMS ${pm.modal_rms.toFixed(2)}`;
+          if (pm.peak_primary_nm != null) tip += ` · peak ${pm.peak_primary_nm.toFixed(1)}nm`;
+          if (pm.valley_primary_nm != null) tip += ` · valley ${pm.valley_primary_nm.toFixed(1)}nm`;
+          td.title = tip;
+          td.style.background = actColor(acts[p]);
+          td.dataset.p = String(p);
+          td.addEventListener("mouseenter", () => {
+            if (!bundleBuf) return;
+            showPopup(p);
+          });
+          tr.appendChild(td);
+        }
+        tbl.appendChild(tr);
+      }
+    }
+
+    function buildModalTable() {
+      const tbl = document.getElementById("gridModal");
+      if (!modalScores.length) return;
+      for (let r = 0; r < G; r++) {
+        const tr = document.createElement("tr");
+        for (let c = 0; c < G; c++) {
+          const p = r * G + c;
+          const td = document.createElement("td");
+          const v = modalScores[p];
+          td.title = `pixel ${p} · modal RMS ${v.toFixed(3)} (vs λ-wise mode)`;
+          td.style.background = modalColor(v);
+          td.dataset.p = String(p);
+          td.addEventListener("mouseenter", () => {
+            if (!bundleBuf) return;
+            showPopup(p);
+          });
+          tr.appendChild(td);
+        }
+        tbl.appendChild(tr);
+      }
+    }
+
+    async function loadEmbeddedBundle() {
+      const b64 = "__BUNDLE_B64__";
+      const comp = Uint8Array.from(atob(b64), x => x.charCodeAt(0));
+      const ds = new DecompressionStream("gzip");
+      const blob = new Blob([comp]);
+      bundleBuf = await new Response(blob.stream().pipeThrough(ds)).arrayBuffer();
+      document.getElementById("hint").textContent =
+        "같은 폴더의 index.html만 열면 됩니다 (스펙트럼은 이 페이지에 포함). 셀에 마우스를 올리면 그래프가 뜹니다.";
+    }
+
+    document.getElementById("hint").textContent = "스펙트럼 번들 복원 중…";
+    loadEmbeddedBundle().then(() => {
+      buildTable();
+      buildModalTable();
+    }).catch(() => {
+      document.getElementById("hint").textContent =
+        "임베드 데이터 복원 실패 (브라우저가 DecompressionStream gzip을 지원하는지 확인).";
+      buildTable();
+      buildModalTable();
+    });
+  </script>
+</body>
+</html>
