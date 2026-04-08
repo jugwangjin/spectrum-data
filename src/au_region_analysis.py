@@ -20,7 +20,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 import numpy as np
-from scipy.ndimage import uniform_filter1d
+from scipy.ndimage import median_filter, uniform_filter1d
 from scipy.signal import find_peaks, peak_widths, savgol_filter
 from tqdm import tqdm
 
@@ -211,14 +211,23 @@ def features_for_pixel(
     prom_vec: np.ndarray,
     clear_prominence_factor: float,
     distance: int,
+    peak_wlen: int = 0,
 ) -> dict:
     """Peaks/valleys on y_smooth. prom_vec: 파장별 prominence 하한 (전 큐브 분포 기반)."""
     dist = max(1, int(distance))
     if prom_vec.shape[0] != y_smooth.shape[0]:
         raise ValueError("prom_vec length must match y_smooth")
 
-    pk_i, pk_prop = find_peaks(y_smooth, prominence=prom_vec, distance=dist)
-    vl_i, vl_prop = find_peaks(-y_smooth, prominence=prom_vec, distance=dist)
+    fp_kw: dict = {}
+    wlen = int(peak_wlen)
+    if wlen > 0:
+        fp_kw["wlen"] = wlen
+    pk_i, pk_prop = find_peaks(
+        y_smooth, prominence=prom_vec, distance=dist, **fp_kw
+    )
+    vl_i, vl_prop = find_peaks(
+        -y_smooth, prominence=prom_vec, distance=dist, **fp_kw
+    )
 
     roi = roi_mask(wl, roi_lo, roi_hi)
     pk_prom = pk_prop["prominences"]
@@ -311,21 +320,189 @@ def features_for_pixel(
     }
 
 
+def _count_persistence_matches(
+    main_roi_idx: np.ndarray, prev_peaks: np.ndarray, tol: int
+) -> int:
+    if main_roi_idx.size == 0:
+        return 0
+    if prev_peaks.size == 0:
+        return 0
+    prev = np.sort(prev_peaks.astype(np.intp))
+    n_ok = 0
+    for i in main_roi_idx.astype(np.intp):
+        lo = int(np.searchsorted(prev, i - tol, side="left"))
+        hi = int(np.searchsorted(prev, i + tol, side="right"))
+        if hi > lo:
+            n_ok += 1
+    return int(n_ok)
+
+
+def robust_extension_features(
+    wl: np.ndarray,
+    y_main: np.ndarray,
+    y_prev: np.ndarray | None,
+    prom_vec: np.ndarray,
+    roi_lo: float,
+    roi_hi: float,
+    distance: int,
+    persistence_tol: int,
+    median_detrend_w: int,
+    residual_prom_scale: float,
+    peak_wlen: int = 0,
+) -> dict[str, float | int | None]:
+    """
+    기본 피크/골 정의는 바꾸지 않고, 견고성 참고 지표만 추가.
+    - 이전 LP 단계와의 인덱스 근접 일치(persistence)
+    - 파장축 median_filter 베이스라인 제거 잔차 위 find_peaks (좁은 스파이크·슬로우 드리프트 분리)
+    """
+    dist = max(1, int(distance))
+    roi = roi_mask(wl, roi_lo, roi_hi)
+    fp_kw: dict = {}
+    if int(peak_wlen) > 0:
+        fp_kw["wlen"] = int(peak_wlen)
+
+    pk_m, _ = find_peaks(y_main, prominence=prom_vec, distance=dist, **fp_kw)
+    vl_m, _ = find_peaks(-y_main, prominence=prom_vec, distance=dist, **fp_kw)
+    pk_roi_idx = pk_m[roi[pk_m]]
+    vl_roi_idx = vl_m[roi[vl_m]]
+    n_pk_roi = int(pk_roi_idx.size)
+    n_vl_roi = int(vl_roi_idx.size)
+
+    out: dict[str, float | int | None] = {}
+
+    tol = max(0, int(persistence_tol))
+    if y_prev is not None and y_prev.shape == y_main.shape:
+        pk_p, _ = find_peaks(y_prev, prominence=prom_vec, distance=dist, **fp_kw)
+        vl_p, _ = find_peaks(-y_prev, prominence=prom_vec, distance=dist, **fp_kw)
+        out["n_peaks_roi_prev_smooth"] = int(np.sum(roi[pk_p]))
+        out["n_valleys_roi_prev_smooth"] = int(np.sum(roi[vl_p]))
+        out["robust_peak_persistence_count"] = _count_persistence_matches(
+            pk_roi_idx, pk_p, tol
+        )
+        out["robust_valley_persistence_count"] = _count_persistence_matches(
+            vl_roi_idx, vl_p, tol
+        )
+        out["robust_peak_persistence_frac"] = float(
+            out["robust_peak_persistence_count"] / max(n_pk_roi, 1)
+        )
+        out["robust_valley_persistence_frac"] = float(
+            out["robust_valley_persistence_count"] / max(n_vl_roi, 1)
+        )
+    else:
+        out["n_peaks_roi_prev_smooth"] = None
+        out["n_valleys_roi_prev_smooth"] = None
+        out["robust_peak_persistence_count"] = None
+        out["robust_valley_persistence_count"] = None
+        out["robust_peak_persistence_frac"] = None
+        out["robust_valley_persistence_frac"] = None
+
+    wdt = int(median_detrend_w)
+    if wdt >= 3:
+        if wdt % 2 == 0:
+            wdt += 1
+        ys = y_main.astype(np.float64)
+        baseline = median_filter(ys, size=wdt, mode="nearest")
+        res = ys - baseline
+        roi_ix = np.flatnonzero(roi)
+        med_prom = (
+            float(np.median(prom_vec[roi]))
+            if roi_ix.size > 0
+            else float(np.median(prom_vec))
+        )
+        floor = max(med_prom * 0.05, 1e-12)
+        prom_r = np.fmax(prom_vec * float(residual_prom_scale), floor)
+        pk_r, _ = find_peaks(res, prominence=prom_r, distance=dist, **fp_kw)
+        vl_r, _ = find_peaks(-res, prominence=prom_r, distance=dist, **fp_kw)
+        out["n_peaks_roi_residual"] = int(np.sum(roi[pk_r]))
+        out["n_valleys_roi_residual"] = int(np.sum(roi[vl_r]))
+    else:
+        out["n_peaks_roi_residual"] = None
+        out["n_valleys_roi_residual"] = None
+
+    return out
+
+
+SPECTRA_VIZ_CHANNELS = 4
+
+
+def build_spectra_viz_channels(
+    n_wl: int,
+    y_col: np.ndarray,
+    feat: dict,
+    clear_vec: np.ndarray,
+    medium_prominence_frac: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    HTML 번들용 sparse 채널: 마킹된 λ만 raw 진폭, 나머지 NaN.
+    clear_* = clear_maxima/minima; medium_* = prominence in [frac·clear, clear).
+    """
+    yf = y_col.astype(np.float64)
+    cp = np.full(n_wl, np.nan, dtype=np.float32)
+    cv = np.full(n_wl, np.nan, dtype=np.float32)
+    mp = np.full(n_wl, np.nan, dtype=np.float32)
+    mv = np.full(n_wl, np.nan, dtype=np.float32)
+    clear_pi = {int(v["index"]) for v in feat.get("clear_maxima", [])}
+    clear_vi = {int(v["index"]) for v in feat.get("clear_minima", [])}
+    for v in feat.get("clear_maxima", []):
+        i = int(v["index"])
+        cp[i] = float(yf[i])
+    for v in feat.get("clear_minima", []):
+        i = int(v["index"])
+        cv[i] = float(yf[i])
+    mfrac = float(medium_prominence_frac)
+    if mfrac > 0.0:
+        for v in feat.get("peaks", []):
+            i = int(v["index"])
+            cvi = float(clear_vec[i])
+            thr = cvi * mfrac
+            p = float(v["prominence"])
+            if p >= thr and p < cvi and i not in clear_pi:
+                mp[i] = float(yf[i])
+        for v in feat.get("valleys", []):
+            i = int(v["index"])
+            cvi = float(clear_vec[i])
+            thr = cvi * mfrac
+            p = float(v["prominence"])
+            if p >= thr and p < cvi and i not in clear_vi:
+                mv[i] = float(yf[i])
+    return cp, cv, mp, mv
+
+
 def write_spectra_bin(
     path: Path,
     raw: np.ndarray,
     smooth_stack: np.ndarray,
+    per_pixel: list[dict],
+    prom_vec: np.ndarray,
+    clear_prominence_factor: float,
+    viz_medium_prominence_frac: float,
 ) -> None:
     """
     raw, smooth_stack: (n_wl, n_pixel). smooth_stack shape (n_levels, n_wl, n_pixel).
-    File: magic, n_wl, n_pixel, n_chan, float32 column-major [wl, pixel] per channel flattened C-order:
-    actually store (n_pixel, n_wl, n_chan) for easy mmap per pixel in JS.
+    채널: raw, LP1..LPk, viz_clear_peak_y, viz_clear_valley_y, viz_medium_peak_y, viz_medium_valley_y
+    (viz는 NaN sparse, 값=해당 λ의 raw 진폭 → 팝업 화살표).
     """
     n_wl, n_pix = raw.shape
     levels = smooth_stack.shape[0]
-    n_chan = 1 + levels
-    cube = np.stack([raw.T] + [smooth_stack[i].T for i in range(levels)], axis=-1)
-    cube = cube.astype(np.float32)
+    n_chan = 1 + levels + SPECTRA_VIZ_CHANNELS
+    clear_vec = clear_prominence_factor * prom_vec
+    base = np.stack([raw.T] + [smooth_stack[i].T for i in range(levels)], axis=-1).astype(
+        np.float32
+    )
+    viz_layers = np.empty((n_pix, n_wl, SPECTRA_VIZ_CHANNELS), dtype=np.float32)
+    for j in range(n_pix):
+        cp, cv, mp, mv = build_spectra_viz_channels(
+            n_wl,
+            raw[:, j],
+            per_pixel[j],
+            clear_vec,
+            viz_medium_prominence_frac,
+        )
+        viz_layers[j, :, 0] = cp
+        viz_layers[j, :, 1] = cv
+        viz_layers[j, :, 2] = mp
+        viz_layers[j, :, 3] = mv
+    cube = np.concatenate([base, viz_layers], axis=-1)
     blob = cube.tobytes(order="C")
     header = struct.pack("<IIII", MAGIC, n_wl, n_pix, n_chan)
     path.write_bytes(header + blob)
@@ -421,8 +598,15 @@ def plot_pixel_figure(
     ax.legend(loc="upper left", fontsize=7, framealpha=0.9)
     mr = feat.get("modal_rms")
     mr_s = f" · modal RMS={mr:.2f}" if mr is not None else ""
+    rp = feat.get("robust_peak_persistence_frac")
+    rv = feat.get("robust_valley_persistence_frac")
+    rsum = ""
+    if rp is not None and rv is not None:
+        rsum = f" · persist p={rp:.2f} v={rv:.2f}"
+    if feat.get("n_peaks_roi_residual") is not None:
+        rsum += f" · res p/v={feat['n_peaks_roi_residual']}/{feat['n_valleys_roi_residual']}"
     ax.set_title(
-        f"score={feat['score']:.1f}{mr_s} | "
+        f"score={feat['score']:.1f}{mr_s}{rsum} | "
         f"strong max(red↑) {len(feat['clear_maxima'])} · "
         f"strong min(green↓) {len(feat['clear_minima'])} · "
         f"ROI {feat['n_peaks_roi']}p/{feat['n_valleys_roi']}v"
@@ -585,6 +769,30 @@ def main() -> None:
         help="인접 피크·골 최소 간격(샘플); 클수록 덜 촘촘히 검출",
     )
     p.add_argument(
+        "--peak-wlen",
+        type=int,
+        default=0,
+        help="find_peaks wlen(샘플). 0이면 미사용(기본, 기존과 동일). >0이면 prominence 평가 구간 제한으로 겹침·넓은 돌출에 덜 민감",
+    )
+    p.add_argument(
+        "--robust-persistence-match-samples",
+        type=int,
+        default=5,
+        help="바로 이전 LP 단계 피크/골과 ±이 샘플 이내면 동일 특징으로 간주(다단계 windows일 때만)",
+    )
+    p.add_argument(
+        "--robust-median-detrend-window",
+        type=int,
+        default=21,
+        help="0 또는 <3이면 끔. 홀수 권장. 스무딩−median_filter 베이스 잔차에서 보조 피크/골 개수(n_*_residual) 계산",
+    )
+    p.add_argument(
+        "--robust-residual-prom-scale",
+        type=float,
+        default=0.35,
+        help="잔차 find_peaks prominence = max(prom_vec*이 값, 작은 바닥)",
+    )
+    p.add_argument(
         "--heatmap-activation-pct-lo",
         type=float,
         default=2.0,
@@ -623,9 +831,21 @@ def main() -> None:
         default=64,
         help="파장별 최빈 진폭용 히스토그램 빈 개수",
     )
+    p.add_argument(
+        "--viz-medium-prominence-frac",
+        type=float,
+        default=0.62,
+        help="spectra.bin·HTML 팝업: clear 미만이나 이 비율×clear 이상인 ROI 피크/골을 «중간» 화살표로 표시. 0이면 clear만",
+    )
     args = p.parse_args()
     if args.prominence_spread_gamma <= 0.0:
         p.error("--prominence-spread-gamma must be > 0")
+    if args.peak_wlen < 0:
+        p.error("--peak-wlen must be >= 0")
+    if args.robust_residual_prom_scale <= 0.0:
+        p.error("--robust-residual-prom-scale must be > 0")
+    if args.viz_medium_prominence_frac < 0.0:
+        p.error("--viz-medium-prominence-frac must be >= 0")
 
     txt = args.txt_path.resolve()
     out = (args.out if args.out is not None else Path(txt.stem)).resolve()
@@ -668,22 +888,59 @@ def main() -> None:
         for li, s in enumerate(ys):
             smooth_stack[li, :, j] = s
     y_smooth_main = smooth_stack[-1]
+    y_smooth_prev = smooth_stack[-2] if n_level >= 2 else None
 
     activations = np.zeros(N_PIXEL, dtype=np.float64)
+    peak_persist_frac = np.full(N_PIXEL, np.nan, dtype=np.float64)
+    valley_persist_frac = np.full(N_PIXEL, np.nan, dtype=np.float64)
+    n_peaks_prev_roi = np.full(N_PIXEL, np.nan, dtype=np.float64)
+    n_valleys_prev_roi = np.full(N_PIXEL, np.nan, dtype=np.float64)
+    n_peaks_residual_roi = np.full(N_PIXEL, np.nan, dtype=np.float64)
+    n_valleys_residual_roi = np.full(N_PIXEL, np.nan, dtype=np.float64)
+    activation_x_peak_persist = np.full(N_PIXEL, np.nan, dtype=np.float64)
+
     per_pixel: list[dict] = []
     for j in pxiter("피크/골·특징"):
+        y_col = y_smooth_main[:, j]
+        y_pr = y_smooth_prev[:, j] if y_smooth_prev is not None else None
         feat = features_for_pixel(
             wl,
             y[:, j],
-            y_smooth_main[:, j],
+            y_col,
             args.roi_lo,
             args.roi_hi,
             prom_vec,
             args.clear_prominence_factor,
             args.peak_distance,
+            args.peak_wlen,
         )
+        aux = robust_extension_features(
+            wl,
+            y_col,
+            y_pr,
+            prom_vec,
+            args.roi_lo,
+            args.roi_hi,
+            args.peak_distance,
+            args.robust_persistence_match_samples,
+            args.robust_median_detrend_window,
+            args.robust_residual_prom_scale,
+            args.peak_wlen,
+        )
+        feat.update(aux)
         activations[j] = feat["score"]
         feat["modal_rms"] = float(modal_rms[j])
+        if aux["robust_peak_persistence_frac"] is not None:
+            peak_persist_frac[j] = float(aux["robust_peak_persistence_frac"])
+            valley_persist_frac[j] = float(aux["robust_valley_persistence_frac"])
+            n_peaks_prev_roi[j] = float(aux["n_peaks_roi_prev_smooth"])
+            n_valleys_prev_roi[j] = float(aux["n_valleys_roi_prev_smooth"])
+            activation_x_peak_persist[j] = feat["score"] * (
+                0.2 + 0.8 * float(aux["robust_peak_persistence_frac"])
+            )
+        if aux["n_peaks_roi_residual"] is not None:
+            n_peaks_residual_roi[j] = float(aux["n_peaks_roi_residual"])
+            n_valleys_residual_roi[j] = float(aux["n_valleys_roi_residual"])
         per_pixel.append(feat)
 
     act_map = activations.reshape(GRID, GRID)
@@ -764,6 +1021,59 @@ def main() -> None:
         "cividis",
     )
 
+    save_heatmap_colorbar(
+        peak_persist_frac.reshape(GRID, GRID),
+        out / "heatmap_robust_peak_persistence_frac_40x40.png",
+        "peak persistence: frac of ROI peaks matched on prev LP (±samples)",
+        "fraction",
+        "viridis",
+    )
+    save_heatmap_colorbar(
+        valley_persist_frac.reshape(GRID, GRID),
+        out / "heatmap_robust_valley_persistence_frac_40x40.png",
+        "valley persistence: frac of ROI valleys matched on prev LP",
+        "fraction",
+        "viridis",
+    )
+    save_heatmap_colorbar(
+        n_peaks_prev_roi.reshape(GRID, GRID),
+        out / "heatmap_peak_count_roi_prev_smooth_40x40.png",
+        "ROI peak count on penultimate Savitzky–Golay level",
+        "count",
+        "cividis",
+    )
+    save_heatmap_colorbar(
+        n_valleys_prev_roi.reshape(GRID, GRID),
+        out / "heatmap_valley_count_roi_prev_smooth_40x40.png",
+        "ROI valley count on penultimate Savitzky–Golay level",
+        "count",
+        "cividis",
+    )
+    save_heatmap_colorbar(
+        n_peaks_residual_roi.reshape(GRID, GRID),
+        out / "heatmap_peak_count_roi_residual_40x40.png",
+        "ROI peaks on median-detrended residual (auxiliary)",
+        "count",
+        "plasma",
+    )
+    save_heatmap_colorbar(
+        n_valleys_residual_roi.reshape(GRID, GRID),
+        out / "heatmap_valley_count_roi_residual_40x40.png",
+        "ROI valleys on median-detrended residual (auxiliary)",
+        "count",
+        "plasma",
+    )
+    save_heatmap_colorbar(
+        activation_x_peak_persist.reshape(GRID, GRID),
+        out / "heatmap_activation_x_peak_persistence_40x40.png",
+        "activation score × (0.2 + 0.8·peak persistence frac)",
+        "score (a.u.)",
+        "magma",
+        percentile_lo=args.heatmap_activation_pct_lo,
+        percentile_hi=args.heatmap_activation_pct_hi,
+        log_scale=args.heatmap_activation_log,
+    )
+
     np.save(out / "activations.npy", activations)
     np.save(out / "modal_amplitude_curve.npy", modal_curve)
     np.save(out / "modal_deviation_rms.npy", modal_rms)
@@ -772,13 +1082,30 @@ def main() -> None:
     np.save(out / "peak_wavelength_nm.npy", peak_nm)
     np.save(out / "peak_width_nm.npy", peak_w_nm)
     np.save(out / "peak_count_roi.npy", peak_count)
+    np.save(out / "robust_peak_persistence_frac.npy", peak_persist_frac)
+    np.save(out / "robust_valley_persistence_frac.npy", valley_persist_frac)
+    np.save(out / "peak_count_roi_prev_smooth.npy", n_peaks_prev_roi)
+    np.save(out / "valley_count_roi_prev_smooth.npy", n_valleys_prev_roi)
+    np.save(out / "peak_count_roi_residual.npy", n_peaks_residual_roi)
+    np.save(out / "valley_count_roi_residual.npy", n_valleys_residual_roi)
+    np.save(out / "activation_x_peak_persistence.npy", activation_x_peak_persist)
 
     bin_path = out / "spectra.bin"
-    write_spectra_bin(bin_path, y, smooth_stack)
+    write_spectra_bin(
+        bin_path,
+        y,
+        smooth_stack,
+        per_pixel,
+        prom_vec,
+        args.clear_prominence_factor,
+        args.viz_medium_prominence_frac,
+    )
 
     meta = {
         "grid": GRID,
         "n_wavelength": int(n_wl),
+        "spectra_viz_channels": int(SPECTRA_VIZ_CHANNELS),
+        "viz_medium_prominence_frac": float(args.viz_medium_prominence_frac),
         "roi_lo": args.roi_lo,
         "roi_hi": args.roi_hi,
         "windows": windows,
@@ -806,6 +1133,20 @@ def main() -> None:
         "valley_wavelength_nm": _pixel_map_for_json(valley_nm),
         "valley_width_nm": _pixel_map_for_json(valley_w_nm),
         "peak_count_roi": [float(x) for x in peak_count.tolist()],
+        "n_smooth_levels": int(n_level),
+        "peak_wlen": int(args.peak_wlen),
+        "robust_persistence_match_samples": int(args.robust_persistence_match_samples),
+        "robust_median_detrend_window": int(args.robust_median_detrend_window),
+        "robust_residual_prom_scale": float(args.robust_residual_prom_scale),
+        "robust_peak_persistence_frac": _pixel_map_for_json(peak_persist_frac),
+        "robust_valley_persistence_frac": _pixel_map_for_json(valley_persist_frac),
+        "peak_count_roi_prev_smooth": _pixel_map_for_json(n_peaks_prev_roi),
+        "valley_count_roi_prev_smooth": _pixel_map_for_json(n_valleys_prev_roi),
+        "peak_count_roi_residual": _pixel_map_for_json(n_peaks_residual_roi),
+        "valley_count_roi_residual": _pixel_map_for_json(n_valleys_residual_roi),
+        "activation_x_peak_persistence": _pixel_map_for_json(
+            activation_x_peak_persist
+        ),
         "pixels": per_pixel,
     }
     write_meta(out / "meta.json", meta)

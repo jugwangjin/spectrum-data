@@ -40,7 +40,7 @@
   </div>
   <div class="mapblock">
     <h2>RMS vs 파장별 최빈 진폭 (전 픽셀 히스토그램 모드)</h2>
-    <p class="sub">색: 유효값 2–98 백분위 선형 스케일(대략 inferno 계열).</p>
+    <p class="sub">진폭·RMS는 물리량 그대로이므로 <strong>선형</strong> 2–98% 백분위만 사용(로그 비적용). activation 맵과 달리 최빈 곡선/편차는 log로 왜곡하지 않음.</p>
     <table class="grid" id="gridModal" aria-label="modal deviation map"></table>
   </div>
   <div class="mapblock">
@@ -69,10 +69,47 @@
     <table class="grid" id="gridValleyW" aria-label="dominant valley width"></table>
   </div>
 
+  <h2 style="font-size:1rem;margin:20px 0 8px;color:#bbb">견고성 보조 (기본 피크/골 정의는 그대로)</h2>
+  <div class="mapblock">
+    <h2>피크 persistence (이전 LP 단계와 ±샘플 일치 비율)</h2>
+    <p class="sub"><code>heatmap_robust_peak_persistence_frac_40x40.png</code> · LP가 한 단계뿐이면 비어 있음</p>
+    <table class="grid" id="gridPersistPeak" aria-label="peak persistence fraction"></table>
+  </div>
+  <div class="mapblock">
+    <h2>골 persistence</h2>
+    <p class="sub"><code>heatmap_robust_valley_persistence_frac_40x40.png</code></p>
+    <table class="grid" id="gridPersistValley" aria-label="valley persistence fraction"></table>
+  </div>
+  <div class="mapblock">
+    <h2>ROI 피크 개수 (바로 이전 Savitzky–Golay 단계)</h2>
+    <p class="sub"><code>heatmap_peak_count_roi_prev_smooth_40x40.png</code></p>
+    <table class="grid" id="gridPeakPrev" aria-label="peak count prev smooth"></table>
+  </div>
+  <div class="mapblock">
+    <h2>ROI 골 개수 (바로 이전 Savitzky–Golay 단계)</h2>
+    <p class="sub"><code>heatmap_valley_count_roi_prev_smooth_40x40.png</code></p>
+    <table class="grid" id="gridValleyPrev" aria-label="valley count prev smooth"></table>
+  </div>
+  <div class="mapblock">
+    <h2>잔차(중앙값 베이스 제거) ROI 피크 개수</h2>
+    <p class="sub"><code>heatmap_peak_count_roi_residual_40x40.png</code> · <code>--robust-median-detrend-window</code> 꺼두면 비어 있음</p>
+    <table class="grid" id="gridPeakResidual" aria-label="residual peak count"></table>
+  </div>
+  <div class="mapblock">
+    <h2>잔차 ROI 골 개수</h2>
+    <p class="sub"><code>heatmap_valley_count_roi_residual_40x40.png</code></p>
+    <table class="grid" id="gridValleyResidual" aria-label="residual valley count"></table>
+  </div>
+  <div class="mapblock">
+    <h2 id="actXPersistTitle">activation × (0.2 + 0.8·피크 persistence)</h2>
+    <p class="sub"><code>heatmap_activation_x_peak_persistence_40x40.png</code> · activation과 동일 로그/백분위(meta)</p>
+    <table class="grid" id="gridActXPersist" aria-label="activation times persistence"></table>
+  </div>
+
   <div id="popup">
     <h2 id="ptitle"></h2>
     <canvas id="ch" height="280"></canvas>
-    <div class="legend">파란: raw · 주황~옅은: LP · 보라 선+점: 파장별 최빈 진폭(참조) · 빨강/녹: 국소 최대·최소 표시</div>
+    <div class="legend">파란: raw · 주황~옅은: LP · 보라: λ별 최빈 진폭 · 빨강/녹: clear 피크/골(번들 채널) · 주황/청록: 중간 prominence(번들) · 예전 번들은 meta 화살표 폴백</div>
   </div>
 
   <script>
@@ -91,6 +128,13 @@
     const valleyNmArr = META.valley_wavelength_nm || [];
     const valleyWArr = META.valley_width_nm || [];
     const peakCountArr = META.peak_count_roi || [];
+    const persistPeakArr = META.robust_peak_persistence_frac || [];
+    const persistValleyArr = META.robust_valley_persistence_frac || [];
+    const peakPrevArr = META.peak_count_roi_prev_smooth || [];
+    const valleyPrevArr = META.valley_count_roi_prev_smooth || [];
+    const peakResArr = META.peak_count_roi_residual || [];
+    const valleyResArr = META.valley_count_roi_residual || [];
+    const actXPersistArr = META.activation_x_peak_persistence || [];
 
     const HM_PCT_LO = 2;
     const HM_PCT_HI = 98;
@@ -147,6 +191,39 @@
       if (!el) return;
       if (actLog) el.textContent += " (로그 색 스케일, meta와 PNG 동일)";
       else el.textContent += " (선형 색 스케일)";
+    })();
+
+    const axpFinite = actXPersistArr.filter((a) => Number.isFinite(a));
+    const axpPos = axpFinite.filter((a) => a > 0);
+    let axpLo, axpHi;
+    if (actLog && axpPos.length) {
+      axpLo = percentile(axpPos, actPctLo);
+      axpHi = percentile(axpFinite, actPctHi);
+      axpLo = Math.max(axpLo, 1e-12);
+      if (axpHi <= axpLo) axpHi = axpLo * 10;
+    } else {
+      axpLo = axpFinite.length ? percentile(axpFinite, actPctLo) : 0;
+      axpHi = axpFinite.length ? percentile(axpFinite, actPctHi) : 1;
+      if (axpHi <= axpLo) axpHi = axpLo + 1e-9;
+    }
+    function actXPersistColor(a) {
+      if (actLog && axpPos.length) {
+        if (!(a > 0) || !Number.isFinite(a)) return "rgb(0,0,0)";
+        const la = Math.log(a);
+        const llo = Math.log(axpLo);
+        const lhi = Math.log(axpHi);
+        const t = (la - llo) / (lhi - llo || 1);
+        return actColorScalar(t);
+      }
+      if (!Number.isFinite(a)) return "#252525";
+      const t = (a - axpLo) / (axpHi - axpLo || 1);
+      return actColorScalar(t);
+    }
+    (function () {
+      const el = document.getElementById("actXPersistTitle");
+      if (!el) return;
+      if (actLog) el.textContent += " (로그 색)";
+      else el.textContent += " (선형)";
     })();
 
     const mFin = finiteList(modalScores);
@@ -238,8 +315,15 @@
 
     function showPopup(p) {
       const chans = readPixelChannels(p);
+      const nLevels = (META.windows && META.windows.length) || 0;
+      const vizCh = META.spectra_viz_channels || 0;
+      const expectLen = 1 + nLevels + vizCh;
+      const bundleHasViz =
+        vizCh > 0 && nLevels > 0 && chans.length === expectLen;
+      const nSmooth = bundleHasViz ? nLevels : chans.length - 1;
       const raw = chans[0];
-      const smooths = chans.slice(1);
+      const smooths = chans.slice(1, 1 + nSmooth);
+      const viz = bundleHasViz ? chans.slice(1 + nSmooth) : [];
       const pm = pixelsMeta[p];
       const xs = Array.from({length: nWl}, (_, i) => xVal(i));
 
@@ -310,50 +394,122 @@
       const yrng = Math.max(...raw) - Math.min(...raw) || 1;
       const dy = yrng * 0.07;
 
-      const maxs = pm.clear_maxima || [];
-      if (maxs.length) {
+      function segFromSparseVizChan(chan, downward) {
         const seg = [];
-        for (const v of maxs) {
-          const x = xVal(v.index);
-          const yy = raw[v.index];
-          seg.push({ x, y: yy - dy }, { x, y: yy });
-          seg.push({ x: NaN, y: NaN });
+        for (let i = 0; i < nWl; i++) {
+          const yy = chan[i];
+          if (typeof yy !== "number" || !Number.isFinite(yy)) continue;
+          const xv = xVal(i);
+          if (downward)
+            seg.push({ x: xv, y: yy + dy }, { x: xv, y: yy }, { x: NaN, y: NaN });
+          else
+            seg.push({ x: xv, y: yy - dy }, { x: xv, y: yy }, { x: NaN, y: NaN });
         }
-        datasets.push({
-          label: "국소 최대 표시",
-          data: seg,
-          type: "line",
-          showLine: true,
-          borderColor: "rgba(255,60,100,0.95)",
-          borderWidth: 2,
-          pointRadius: 0,
-          fill: false,
-          spanGaps: false,
-          order: 20,
-        });
+        return seg;
       }
 
-      const mins = pm.clear_minima || [];
-      if (mins.length) {
-        const seg = [];
-        for (const v of mins) {
-          const x = xVal(v.index);
-          const yy = raw[v.index];
-          seg.push({ x, y: yy + dy }, { x, y: yy });
-          seg.push({ x: NaN, y: NaN });
+      if (viz.length >= 4) {
+        const sMax = segFromSparseVizChan(viz[0], false);
+        const sMin = segFromSparseVizChan(viz[1], true);
+        const mMax = segFromSparseVizChan(viz[2], false);
+        const mMin = segFromSparseVizChan(viz[3], true);
+        if (sMax.length)
+          datasets.push({
+            label: "국소 최대 (clear)",
+            data: sMax,
+            type: "line",
+            showLine: true,
+            borderColor: "rgba(255,60,100,0.95)",
+            borderWidth: 2,
+            pointRadius: 0,
+            fill: false,
+            spanGaps: false,
+            order: 20,
+          });
+        if (sMin.length)
+          datasets.push({
+            label: "국소 최소 (clear)",
+            data: sMin,
+            type: "line",
+            showLine: true,
+            borderColor: "rgba(0,220,90,0.95)",
+            borderWidth: 2,
+            pointRadius: 0,
+            fill: false,
+            spanGaps: false,
+            order: 21,
+          });
+        if (mMax.length)
+          datasets.push({
+            label: "피크 (중간 prominence)",
+            data: mMax,
+            type: "line",
+            showLine: true,
+            borderColor: "rgba(255,170,70,0.9)",
+            borderWidth: 1.5,
+            pointRadius: 0,
+            fill: false,
+            spanGaps: false,
+            order: 18,
+          });
+        if (mMin.length)
+          datasets.push({
+            label: "골 (중간 prominence)",
+            data: mMin,
+            type: "line",
+            showLine: true,
+            borderColor: "rgba(0,200,185,0.9)",
+            borderWidth: 1.5,
+            pointRadius: 0,
+            fill: false,
+            spanGaps: false,
+            order: 19,
+          });
+      } else {
+        const maxs = pm.clear_maxima || [];
+        if (maxs.length) {
+          const seg = [];
+          for (const v of maxs) {
+            const x = xVal(v.index);
+            const yy = raw[v.index];
+            seg.push({ x, y: yy - dy }, { x, y: yy });
+            seg.push({ x: NaN, y: NaN });
+          }
+          datasets.push({
+            label: "국소 최대 표시 (meta)",
+            data: seg,
+            type: "line",
+            showLine: true,
+            borderColor: "rgba(255,60,100,0.95)",
+            borderWidth: 2,
+            pointRadius: 0,
+            fill: false,
+            spanGaps: false,
+            order: 20,
+          });
         }
-        datasets.push({
-          label: "국소 최소 표시",
-          data: seg,
-          type: "line",
-          showLine: true,
-          borderColor: "rgba(0,220,90,0.95)",
-          borderWidth: 2,
-          pointRadius: 0,
-          fill: false,
-          spanGaps: false,
-          order: 21,
-        });
+        const mins = pm.clear_minima || [];
+        if (mins.length) {
+          const seg = [];
+          for (const v of mins) {
+            const x = xVal(v.index);
+            const yy = raw[v.index];
+            seg.push({ x, y: yy + dy }, { x, y: yy });
+            seg.push({ x: NaN, y: NaN });
+          }
+          datasets.push({
+            label: "국소 최소 표시 (meta)",
+            data: seg,
+            type: "line",
+            showLine: true,
+            borderColor: "rgba(0,220,90,0.95)",
+            borderWidth: 2,
+            pointRadius: 0,
+            fill: false,
+            spanGaps: false,
+            order: 21,
+          });
+        }
       }
 
       const popup = document.getElementById("popup");
@@ -370,6 +526,10 @@
       if (mr != null && Number.isFinite(mr)) extra += ` · modal RMS=${mr.toFixed(2)}`;
       let mapLine = "";
       if (peakNmArr.length === G * G) mapLine += ` | maps: peakλ ${fmt(peakNmArr[p], 2)} w ${fmt(peakWArr[p], 2)} · vλ ${fmt(valleyNmArr[p], 2)} vw ${fmt(valleyWArr[p], 2)} · nPeak ${fmt(peakCountArr[p], 0)}`;
+      if (pm.robust_peak_persistence_frac != null)
+        mapLine += ` · persistP ${(+pm.robust_peak_persistence_frac).toFixed(2)}`;
+      if (pm.n_peaks_roi_residual != null)
+        mapLine += ` · resPv ${pm.n_peaks_roi_residual}/${pm.n_valleys_roi_residual}`;
       title.textContent = `pixel ${p} (row ${r}, col ${c}) · act score=${(pm.score||0).toFixed(1)}${extra}${mapLine}`;
 
       popup.style.display = "block";
@@ -537,6 +697,126 @@
       }
     }
 
+    function buildPersistPeakTable() {
+      const tbl = document.getElementById("gridPersistPeak");
+      if (!tbl || persistPeakArr.length !== G * G) return;
+      for (let r = 0; r < G; r++) {
+        const tr = document.createElement("tr");
+        for (let c = 0; c < G; c++) {
+          const p = r * G + c;
+          const td = document.createElement("td");
+          const v = persistPeakArr[p];
+          td.title = `pixel ${p} · peak persistence ${fmt(v, 3)}`;
+          td.style.background = metricLinearColor(v, persistPeakArr, viridisT);
+          wireCell(td, p);
+          tr.appendChild(td);
+        }
+        tbl.appendChild(tr);
+      }
+    }
+    function buildPersistValleyTable() {
+      const tbl = document.getElementById("gridPersistValley");
+      if (!tbl || persistValleyArr.length !== G * G) return;
+      for (let r = 0; r < G; r++) {
+        const tr = document.createElement("tr");
+        for (let c = 0; c < G; c++) {
+          const p = r * G + c;
+          const td = document.createElement("td");
+          const v = persistValleyArr[p];
+          td.title = `pixel ${p} · valley persistence ${fmt(v, 3)}`;
+          td.style.background = metricLinearColor(v, persistValleyArr, viridisT);
+          wireCell(td, p);
+          tr.appendChild(td);
+        }
+        tbl.appendChild(tr);
+      }
+    }
+    function buildPeakPrevTable() {
+      const tbl = document.getElementById("gridPeakPrev");
+      if (!tbl || peakPrevArr.length !== G * G) return;
+      for (let r = 0; r < G; r++) {
+        const tr = document.createElement("tr");
+        for (let c = 0; c < G; c++) {
+          const p = r * G + c;
+          const td = document.createElement("td");
+          const v = peakPrevArr[p];
+          td.title = `pixel ${p} · peaks (prev LP) ROI ${fmt(v, 0)}`;
+          td.style.background = metricLinearColor(v, peakPrevArr, cividisT);
+          wireCell(td, p);
+          tr.appendChild(td);
+        }
+        tbl.appendChild(tr);
+      }
+    }
+    function buildValleyPrevTable() {
+      const tbl = document.getElementById("gridValleyPrev");
+      if (!tbl || valleyPrevArr.length !== G * G) return;
+      for (let r = 0; r < G; r++) {
+        const tr = document.createElement("tr");
+        for (let c = 0; c < G; c++) {
+          const p = r * G + c;
+          const td = document.createElement("td");
+          const v = valleyPrevArr[p];
+          td.title = `pixel ${p} · valleys (prev LP) ROI ${fmt(v, 0)}`;
+          td.style.background = metricLinearColor(v, valleyPrevArr, cividisT);
+          wireCell(td, p);
+          tr.appendChild(td);
+        }
+        tbl.appendChild(tr);
+      }
+    }
+    function buildPeakResidualTable() {
+      const tbl = document.getElementById("gridPeakResidual");
+      if (!tbl || peakResArr.length !== G * G) return;
+      for (let r = 0; r < G; r++) {
+        const tr = document.createElement("tr");
+        for (let c = 0; c < G; c++) {
+          const p = r * G + c;
+          const td = document.createElement("td");
+          const v = peakResArr[p];
+          td.title = `pixel ${p} · residual ROI peaks ${fmt(v, 0)}`;
+          td.style.background = metricLinearColor(v, peakResArr, plasmaT);
+          wireCell(td, p);
+          tr.appendChild(td);
+        }
+        tbl.appendChild(tr);
+      }
+    }
+    function buildValleyResidualTable() {
+      const tbl = document.getElementById("gridValleyResidual");
+      if (!tbl || valleyResArr.length !== G * G) return;
+      for (let r = 0; r < G; r++) {
+        const tr = document.createElement("tr");
+        for (let c = 0; c < G; c++) {
+          const p = r * G + c;
+          const td = document.createElement("td");
+          const v = valleyResArr[p];
+          td.title = `pixel ${p} · residual ROI valleys ${fmt(v, 0)}`;
+          td.style.background = metricLinearColor(v, valleyResArr, plasmaT);
+          wireCell(td, p);
+          tr.appendChild(td);
+        }
+        tbl.appendChild(tr);
+      }
+    }
+    function buildActXPersistTable() {
+      const tbl = document.getElementById("gridActXPersist");
+      if (!tbl || actXPersistArr.length !== G * G) return;
+      for (let r = 0; r < G; r++) {
+        const tr = document.createElement("tr");
+        for (let c = 0; c < G; c++) {
+          const p = r * G + c;
+          const td = document.createElement("td");
+          const v = actXPersistArr[p];
+          td.title = `pixel ${p} · act×persist ${fmt(v, 2)}`;
+          td.style.background = actXPersistColor(v);
+          wireCell(td, p);
+          tr.appendChild(td);
+        }
+        tbl.appendChild(tr);
+      }
+    }
+
     async function loadEmbeddedBundle() {
       const b64 = "__BUNDLE_B64__";
       const comp = Uint8Array.from(atob(b64), x => x.charCodeAt(0));
@@ -558,6 +838,13 @@
       buildPeakWTable();
       buildValleyNmTable();
       buildValleyWTable();
+      buildPersistPeakTable();
+      buildPersistValleyTable();
+      buildPeakPrevTable();
+      buildValleyPrevTable();
+      buildPeakResidualTable();
+      buildValleyResidualTable();
+      buildActXPersistTable();
     }
     loadEmbeddedBundle().then(() => {
       buildAllGrids();
