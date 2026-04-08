@@ -2,7 +2,7 @@
 40x40 (1600) spectral cube: tab-separated rows = wavelength samples, col0 = λ (nm), cols 1..1600 = amplitude.
 
 Outputs under --out (기본: 입력 txt의 stem 디렉터리): index.html (스펙트럼 gzip+base64 임베드, 로컬 서버 불필요),
-heatmaps + colorbars, meta.json, spectra.bin, optional per-pixel PNGs.
+heatmaps + colorbars, meta.json, spectra.bin, 스펙트럼 분해 산출물(기본 K-means·L2·성분 10); 픽셀 PNG는 `--pixel-pngs`일 때만.
 """
 
 from __future__ import annotations
@@ -688,6 +688,478 @@ def save_heatmap_colorbar(
     plt.close(fig)
 
 
+def save_heatmap_symmetric_colorbar(
+    data: np.ndarray,
+    out_path: Path,
+    title: str,
+    cbar_label: str,
+    cmap: str = "coolwarm",
+    percentile_abs: float = 98.0,
+) -> None:
+    """부호 있는 값: |·|의 백분위로 대칭 vmin/vmax (0 중심)."""
+    z = np.ma.masked_invalid(data.astype(np.float64))
+    finite = np.abs(z.compressed())
+    vmax = float(np.percentile(finite, percentile_abs)) if finite.size else 1.0
+    vmax = max(vmax, 1e-12)
+    fig, ax = plt.subplots(figsize=(5.2, 4.4), dpi=150, layout="constrained")
+    im = ax.imshow(
+        z,
+        origin="upper",
+        interpolation="nearest",
+        cmap=cmap,
+        vmin=-vmax,
+        vmax=vmax,
+    )
+    ax.set_title(title)
+    ax.set_xlabel("col")
+    ax.set_ylabel("row")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label(cbar_label)
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def save_heatmap_ica_scores(
+    data: np.ndarray,
+    out_path: Path,
+    title: str,
+    cbar_label: str,
+    linear: bool,
+    asinh_scale: float,
+    cmap: str = "coolwarm",
+    percentile_abs: float = 98.0,
+) -> None:
+    """
+    ICA 픽셀 점수: linear면 대칭 선형 스케일.
+    기본(asinh): sign(x)·asinh(|x|/s) 로 대칭 «log-like» 압축(HTML과 동일 s 사용).
+    """
+    z = data.astype(np.float64)
+    if linear:
+        save_heatmap_symmetric_colorbar(
+            z, out_path, title, cbar_label, cmap=cmap, percentile_abs=percentile_abs
+        )
+        return
+    s = max(float(asinh_scale), 1e-18)
+    z_t = np.sign(z) * np.arcsinh(np.abs(z) / s)
+    z_t = np.where(np.isfinite(z), z_t, np.nan)
+    finite = np.abs(z_t[np.isfinite(z_t)])
+    vmax = float(np.percentile(finite, percentile_abs)) if finite.size else 1.0
+    vmax = max(vmax, 1e-12)
+    fig, ax = plt.subplots(figsize=(5.2, 4.4), dpi=150, layout="constrained")
+    im = ax.imshow(
+        np.ma.masked_invalid(z_t),
+        origin="upper",
+        interpolation="nearest",
+        cmap=cmap,
+        vmin=-vmax,
+        vmax=vmax,
+    )
+    ax.set_title(title)
+    ax.set_xlabel("col")
+    ax.set_ylabel("row")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label(f"{cbar_label} (asinh·s={s:.3g})")
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def save_ica_spectrum_scatter(
+    wl: np.ndarray,
+    values: np.ndarray,
+    out_path: Path,
+    title: str,
+    y_label: str,
+    x_is_index: bool,
+) -> None:
+    """λ(또는 인덱스)–진폭/mixing 등 대표 곡선을 산점도로 PNG 저장."""
+    v = np.asarray(values, dtype=np.float64).ravel()
+    n = min(int(wl.shape[0]), v.size)
+    wl = np.asarray(wl, dtype=np.float64).ravel()[:n]
+    v = v[:n]
+    x = np.arange(1, n + 1, dtype=np.float64) if x_is_index else wl
+    x_label = "λ sample index (1..N)" if x_is_index else "λ (nm)"
+    fig, ax = plt.subplots(figsize=(5.5, 3.6), dpi=150, layout="constrained")
+    sc = ax.scatter(x, v, s=8, c=x, cmap="viridis", alpha=0.88, linewidths=0)
+    ax.set_title(title)
+    ax.set_ylabel(y_label)
+    ax.set_xlabel(x_label)
+    fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label=x_label)
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def compute_envelope_reference_spectrum(
+    y: np.ndarray,
+    pct_lo: float,
+    pct_hi: float,
+    smooth_window: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    파장 λ마다 픽셀 축 분포로 «참조 진폭» 한 점을 고름 (분해 성분 아님, 비교·후속 분석용).
+
+    관측: 피크가 두드러진 λ에서는 픽셀 간 **하한**이, 골이 두드러진 λ에서는 **상한**이
+    상대적으로 잘 정의되는 경우가 많다는 가정에 따라,
+    행별 중앙값 med(λ)를 파장축으로 스무딩한 baseline(λ)과 비교해
+    med > baseline → «피크형» → pct_lo 분위(하한 쪽),
+    med < baseline → «골형» → pct_hi 분위(상한 쪽),
+    그 외 → med.
+    """
+    med_row = np.median(y, axis=1).astype(np.float64)
+    p_lo_v = np.percentile(y, pct_lo, axis=1).astype(np.float64)
+    p_hi_v = np.percentile(y, pct_hi, axis=1).astype(np.float64)
+    sw = int(smooth_window)
+    if sw < 3:
+        return med_row.copy(), np.zeros(y.shape[0], dtype=bool)
+    w = sw if sw % 2 == 1 else sw + 1
+    baseline = uniform_filter1d(med_row, size=w, mode="nearest")
+    eps = 1e-12 * (np.abs(baseline) + 1.0)
+    peak_like = med_row > baseline + eps
+    valley_like = med_row < baseline - eps
+    ref = np.where(peak_like, p_lo_v, np.where(valley_like, p_hi_v, med_row))
+    return ref.astype(np.float64), peak_like
+
+
+def run_decomposition_on_cube(
+    y: np.ndarray,
+    wl: np.ndarray,
+    n_components: int,
+    method: str,
+    random_state: int,
+    standardize: bool,
+    out_dir: Path,
+    max_iter: int,
+    x_index: bool,
+    linear_score_heatmap: bool,
+    nmf_alpha: float,
+    nmf_l1_ratio: float,
+    nmf_envelope_residual: bool,
+    kmeans_normalize: str,
+    ref_env_pct_lo: float,
+    ref_env_pct_hi: float,
+    ref_env_smooth_window: int,
+) -> dict | None:
+    """
+    픽셀별 스펙트럼 행 (n_pixel, n_wl)에 FastICA / NMF / K-means.
+
+    - FastICA: 부호·스케일 모호성 있음(음수 정상). mixing 열 ≈ λ 패턴.
+    - NMF: X≈W·H, W,H≥0. 기본 입력은 엔벨롭 참조 대비 양의 잔차 max(y-env,0)(공통 형태 제거);
+      끄면 기존처럼 raw 양수 클립만 사용.
+    - K-means: 픽셀당 **정확히 하나**의 성분에만 1(진짜 one-hot). 성분 스펙트럼=클러스터 중심.
+      일반적으로 각 클러스터에 픽셀 ≥1개(빈 클러스터는 드묾). 선형 혼합 아님(Voronoi).
+
+    전역 mean/median 및 **엔벨롭 참조**(피크형→하위 분위, 골형→상위 분위)는 성분에 포함되지 않음 — 비교용.
+    """
+    from sklearn.cluster import KMeans
+    from sklearn.decomposition import FastICA, NMF
+    from sklearn.preprocessing import StandardScaler
+
+    n_wl, n_pix = y.shape
+    K = min(int(n_components), n_pix, n_wl)
+    if K < 1:
+        return None
+    mean_y = np.mean(y, axis=1)
+    median_y = np.median(y, axis=1)
+    save_ica_spectrum_scatter(
+        wl,
+        mean_y,
+        out_dir / "ica_ref_mean_spectrum_scatter.png",
+        "Reference: pixel-mean spectrum (raw y, not an ICA component)",
+        "mean amplitude (raw)",
+        x_index,
+    )
+    save_ica_spectrum_scatter(
+        wl,
+        median_y,
+        out_dir / "ica_ref_median_spectrum_scatter.png",
+        "Reference: pixel-median spectrum (raw y, not an ICA component)",
+        "median amplitude (raw)",
+        x_index,
+    )
+    np.save(out_dir / "ica_ref_mean_spectrum_y.npy", mean_y)
+    np.save(out_dir / "ica_ref_median_spectrum_y.npy", median_y)
+
+    env_y, env_peak_like = compute_envelope_reference_spectrum(
+        y, ref_env_pct_lo, ref_env_pct_hi, ref_env_smooth_window
+    )
+    save_ica_spectrum_scatter(
+        wl,
+        env_y,
+        out_dir / "ica_ref_envelope_spectrum_scatter.png",
+        "Reference: envelope (peak-like λ→pct_lo, valley-like→pct_hi; not a component)",
+        f"envelope ref (pct {ref_env_pct_lo}/{ref_env_pct_hi})",
+        x_index,
+    )
+    np.save(out_dir / "ica_ref_envelope_spectrum_y.npy", env_y)
+    np.save(out_dir / "ica_ref_envelope_peak_like.npy", env_peak_like)
+    ref_common = {
+        "mean_spectrum_y_raw": mean_y.astype(float).tolist(),
+        "median_spectrum_y_raw": median_y.astype(float).tolist(),
+        "envelope_ref_spectrum_y_raw": env_y.astype(float).tolist(),
+        "envelope_ref_peak_like": env_peak_like.astype(bool).tolist(),
+        "envelope_ref_pct_lo": float(ref_env_pct_lo),
+        "envelope_ref_pct_hi": float(ref_env_pct_hi),
+        "envelope_ref_smooth_window": int(ref_env_smooth_window),
+    }
+
+    method_l = method.strip().lower()
+    if method_l == "nmf":
+        y_row = y.T.astype(np.float64)
+        if nmf_envelope_residual:
+            env_1d = env_y.astype(np.float64)
+            X = np.maximum(y_row - env_1d[np.newaxis, :], 0.0)
+            X = np.maximum(X, 1e-12)
+        else:
+            X = np.maximum(y_row, 1e-12)
+        nmf = NMF(
+            n_components=K,
+            init="nndsvda",
+            random_state=random_state,
+            max_iter=int(max_iter),
+            solver="mu",
+            beta_loss="frobenius",
+            alpha_W=float(nmf_alpha),
+            alpha_H=float(nmf_alpha),
+            l1_ratio=float(nmf_l1_ratio),
+        )
+        S = nmf.fit_transform(X)
+        H = nmf.components_
+        M = H.T
+        variances = np.var(S, axis=0)
+        order = np.argsort(-variances)
+        S_ord = S[:, order]
+        M_ord = M[:, order]
+        var_ord = variances[order].astype(float).tolist()
+        score_display = {
+            "mode": "nonnegative_log"
+            if not linear_score_heatmap
+            else "nonnegative_linear",
+            "asinh_scale": None,
+        }
+        method_name = "NMF"
+        score_cbar = "activation (W)"
+        mixing_ylabel = "H weight (≥0)"
+        if nmf_envelope_residual:
+            note = (
+                "NMF: 입력 X_pixel,λ = max(raw − envelope_ref(λ), 0) 후 X≈W·H (공통 형태 대비 «특이» 양의 잔차). "
+                "H는 잔차 공간의 λ 패턴(≥0). score_variance는 W 열 분산 프록시. "
+                "L1·alpha로 희소 유도(one-hot 비보장). "
+                "mean/median/엔벨롭 산점도는 여전히 raw 큐브 요약(성분 아님). "
+                "전 스펙트럼 형태로 H를 읽으려면 --no-nmf-envelope-residual."
+            )
+        else:
+            note = (
+                "NMF: X≈W·H, W,H≥0. 입력은 raw 양수 클립만. score_variance는 W 열 분산 프록시. "
+                "H 행=λ 패턴(비음수). L1·alpha로 희소 유도(단일 λ one-hot은 보장 안 됨). "
+                "mean/median/엔벨롭 참조는 성분 아님(비교·후속 분석용)."
+            )
+        for k in range(K):
+            hmap = S_ord[:, k].reshape(GRID, GRID)
+            save_heatmap_colorbar(
+                hmap,
+                out_dir / f"heatmap_ica_component{k:02d}_40x40.png",
+                f"NMF component {k + 1} (rank {k + 1} by W variance)",
+                score_cbar,
+                "magma",
+                percentile_lo=2.0,
+                percentile_hi=98.0,
+                log_scale=not linear_score_heatmap,
+            )
+            h_sub = "λ excess>envelope ref" if nmf_envelope_residual else "λ-shape"
+            save_ica_spectrum_scatter(
+                wl,
+                M_ord[:, k],
+                out_dir / f"ica_mixing_component{k:02d}_scatter.png",
+                f"NMF H ({h_sub}) {k + 1} · rank {k + 1} by W variance",
+                mixing_ylabel,
+                x_index,
+            )
+        np.save(out_dir / "ica_mixing_ordered.npy", M_ord)
+        np.save(out_dir / "ica_sources_ordered.npy", S_ord)
+        np.save(out_dir / "ica_mixing.npy", M)
+        np.save(out_dir / "ica_sources.npy", S)
+        wl_list = wl.astype(float).tolist()
+        mixing_list = [M_ord[:, k].astype(float).tolist() for k in range(K)]
+        scores_list = [S_ord[:, k].astype(float).tolist() for k in range(K)]
+        return {
+            **ref_common,
+            "method": method_name,
+            "decomposition_backend": "nmf",
+            "n_components": int(K),
+            "random_state": int(random_state),
+            "standardize_features": False,
+            "nmf_alpha": float(nmf_alpha),
+            "nmf_l1_ratio": float(nmf_l1_ratio),
+            "nmf_envelope_residual": bool(nmf_envelope_residual),
+            "score_sign": "nonnegative",
+            "score_variance_per_component_ordered": var_ord,
+            "mixing_columns_ordered": mixing_list,
+            "pixel_scores_ordered": scores_list,
+            "wavelength": wl_list,
+            "ica_score_display": score_display,
+            "note": note,
+        }
+
+    if method_l == "kmeans":
+        X = np.maximum(y.T.astype(np.float64), 1e-12)
+        kn = (kmeans_normalize or "none").strip().lower()
+        if kn == "l2":
+            norms = np.linalg.norm(X, axis=1, keepdims=True)
+            norms = np.maximum(norms, 1e-18)
+            X_fit = X / norms
+        else:
+            X_fit = X
+        km = KMeans(
+            n_clusters=K,
+            random_state=random_state,
+            n_init=10,
+            max_iter=int(max(300, max_iter)),
+        )
+        labels = km.fit_predict(X_fit)
+        counts = np.bincount(labels, minlength=K).astype(np.float64)
+        order = np.argsort(-counts)
+        inv = np.empty_like(order)
+        inv[order] = np.arange(K)
+        labels_ord = inv[labels]
+        S = np.zeros((n_pix, K), dtype=np.float64)
+        S[np.arange(n_pix, dtype=np.intp), labels_ord] = 1.0
+        centers = km.cluster_centers_[order]
+        M = centers.T
+        variances = np.var(S, axis=0)
+        var_ord = variances.astype(float).tolist()
+        S_ord = S
+        M_ord = M
+        score_display = {
+            "mode": "nonnegative_linear",
+            "asinh_scale": None,
+        }
+        note = (
+            "K-means: 픽셀마다 정확히 한 성분만 1(진짜 one-hot), 나머지 0. "
+            "성분 곡선=클러스터 중심(군집 공간에서). 선형 분해 X≈WH 아님. "
+            f"군집 입력: raw 양수 클립 후 {'L2 행 정규화(형태 위주)' if kn == 'l2' else '진폭 유지'}. "
+            "각 성분에 대응 픽셀이 최소 1개 있음(빈 클러스터 제외). "
+            "NMF보다 덜 «patchwork»일 수 있으나 혼합 스펙트럼은 한 라벨로만 표현됨."
+        )
+        score_cbar = "cluster membership (0/1)"
+        mixing_ylabel = "cluster center amp."
+        for k in range(K):
+            hmap = S_ord[:, k].reshape(GRID, GRID)
+            save_heatmap_colorbar(
+                hmap,
+                out_dir / f"heatmap_ica_component{k:02d}_40x40.png",
+                f"K-means cluster {k + 1} (rank {k + 1} by size)",
+                score_cbar,
+                "magma",
+                percentile_lo=0.0,
+                percentile_hi=100.0,
+                log_scale=False,
+            )
+            save_ica_spectrum_scatter(
+                wl,
+                M_ord[:, k],
+                out_dir / f"ica_mixing_component{k:02d}_scatter.png",
+                f"K-means center {k + 1} · rank {k + 1} by cluster size",
+                mixing_ylabel,
+                x_index,
+            )
+        np.save(out_dir / "ica_mixing_ordered.npy", M_ord)
+        np.save(out_dir / "ica_sources_ordered.npy", S_ord)
+        np.save(out_dir / "ica_mixing.npy", M)
+        np.save(out_dir / "ica_sources.npy", S)
+        np.save(out_dir / "ica_kmeans_labels_ordered.npy", labels_ord)
+        wl_list = wl.astype(float).tolist()
+        mixing_list = [M_ord[:, k].astype(float).tolist() for k in range(K)]
+        scores_list = [S_ord[:, k].astype(float).tolist() for k in range(K)]
+        cluster_sizes = [int(counts[order[j]]) for j in range(K)]
+        return {
+            **ref_common,
+            "method": "K-means (1-hot)",
+            "decomposition_backend": "kmeans",
+            "n_components": int(K),
+            "random_state": int(random_state),
+            "standardize_features": False,
+            "kmeans_normalize": kn,
+            "cluster_sizes_ordered": cluster_sizes,
+            "score_sign": "nonnegative",
+            "pixel_code": "one_hot_exclusive",
+            "score_variance_per_component_ordered": var_ord,
+            "mixing_columns_ordered": mixing_list,
+            "pixel_scores_ordered": scores_list,
+            "wavelength": wl_list,
+            "ica_score_display": score_display,
+            "note": note,
+        }
+
+    X = y.T.astype(np.float64)
+    if standardize:
+        X = StandardScaler().fit_transform(X)
+    ica = FastICA(
+        n_components=K,
+        random_state=random_state,
+        whiten="unit-variance",
+        max_iter=int(max_iter),
+        tol=1e-4,
+    )
+    S = ica.fit_transform(X)
+    M = ica.mixing_
+    variances = np.var(S, axis=0)
+    order = np.argsort(-variances)
+    S_ord = S[:, order]
+    M_ord = M[:, order]
+    var_ord = variances[order].astype(float).tolist()
+    abs_S = np.abs(S_ord[np.isfinite(S_ord)])
+    asinh_scale = float(np.median(abs_S)) if abs_S.size else 1.0
+    asinh_scale = max(asinh_scale, 1e-18)
+    score_display = {
+        "mode": "linear" if linear_score_heatmap else "asinh",
+        "asinh_scale": asinh_scale if not linear_score_heatmap else None,
+    }
+    for k in range(K):
+        hmap = S_ord[:, k].reshape(GRID, GRID)
+        save_heatmap_ica_scores(
+            hmap,
+            out_dir / f"heatmap_ica_component{k:02d}_40x40.png",
+            f"FastICA component {k + 1} (rank {k + 1} by score variance)",
+            "source score",
+            linear=linear_score_heatmap,
+            asinh_scale=asinh_scale,
+        )
+        save_ica_spectrum_scatter(
+            wl,
+            M_ord[:, k],
+            out_dir / f"ica_mixing_component{k:02d}_scatter.png",
+            f"FastICA mixing column {k + 1} (λ-shape · rank {k + 1} by score variance)",
+            "mixing weight",
+            x_index,
+        )
+    np.save(out_dir / "ica_mixing_ordered.npy", M_ord)
+    np.save(out_dir / "ica_sources_ordered.npy", S_ord)
+    np.save(out_dir / "ica_mixing.npy", M)
+    np.save(out_dir / "ica_sources.npy", S)
+    wl_list = wl.astype(float).tolist()
+    mixing_list = [M_ord[:, k].astype(float).tolist() for k in range(K)]
+    scores_list = [S_ord[:, k].astype(float).tolist() for k in range(K)]
+    return {
+        **ref_common,
+        "method": "FastICA",
+        "decomposition_backend": "fastica",
+        "n_components": int(K),
+        "random_state": int(random_state),
+        "standardize_features": bool(standardize),
+        "score_sign": "signed",
+        "score_variance_per_component_ordered": var_ord,
+        "mixing_columns_ordered": mixing_list,
+        "pixel_scores_ordered": scores_list,
+        "wavelength": wl_list,
+        "ica_score_display": score_display,
+        "note": (
+            "ICA는 PCA처럼 고유값이 없음. score_variance는 픽셀 간 분산(에너지) 프록시. "
+            "mixing 열은 λ별 패턴. 음수는 부호·스케일 모호성(성분·mixing 동시 뒤집기와 동치)이라 "
+            "해석은 크기·상대형태 위주. 비음수 혼합(NMF)은 --ica-method nmf. 기본 분해는 kmeans. "
+            "mean/median/엔벨롭 참조는 성분이 아니라 큐브 요약(비교용)."
+        ),
+    }
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -816,9 +1288,10 @@ def main() -> None:
         help="use 1..N for plot x instead of wavelength",
     )
     p.add_argument(
-        "--no-pixel-pngs",
-        action="store_true",
-        help="skip writing output/pixels/*.png (faster; use HTML hover for spectra)",
+        "--pixel-pngs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="픽셀별 PNG 1600장 출력(느림). 기본 끔 — HTML 호버로 스펙트럼. 켜려면 --pixel-pngs",
     )
     p.add_argument(
         "--no-progress",
@@ -837,6 +1310,84 @@ def main() -> None:
         default=0.62,
         help="spectra.bin·HTML 팝업: clear 미만이나 이 비율×clear 이상인 ROI 피크/골을 «중간» 화살표로 표시. 0이면 clear만",
     )
+    p.add_argument(
+        "--ica-n-components",
+        type=int,
+        default=10,
+        help="0이면 분해 생략. 기본 10. min(n_λ,1600)으로 잘림",
+    )
+    p.add_argument(
+        "--ica-random-state",
+        type=int,
+        default=0,
+        help="스펙트럼 분해(NMF·K-means·FastICA) 난수 시드",
+    )
+    p.add_argument(
+        "--ica-no-standardize",
+        action="store_true",
+        help="ICA 입력에서 파장축 StandardScaler 생략",
+    )
+    p.add_argument(
+        "--ica-max-iter",
+        type=int,
+        default=1000,
+        help="분해 반복 상한(NMF·K-means·FastICA)",
+    )
+    p.add_argument(
+        "--ica-linear-score-heatmap",
+        action="store_true",
+        help="ICA 픽셀 점수 히트맵·HTML 격자: 대칭 선형 스케일(기본은 asinh=log-like 대칭). NMF면 비음수 선형(끄면 log colorbar)",
+    )
+    p.add_argument(
+        "--ica-method",
+        type=str,
+        choices=("fastica", "nmf", "kmeans"),
+        default="kmeans",
+        help="kmeans(기본): 픽셀당 one-hot 클러스터. nmf: 비음수 W·H. fastica: 부호 ICA",
+    )
+    p.add_argument(
+        "--spectral-kmeans-normalize",
+        type=str,
+        choices=("none", "l2"),
+        default="l2",
+        help="--ica-method kmeans 일 때만(그 외 방법은 무시): l2(기본)=행 L2 정규화 후 군집(형태 위주), none=진폭 유지",
+    )
+    p.add_argument(
+        "--nmf-alpha",
+        type=float,
+        default=0.05,
+        help="NMF L1/L2 정규화 강도(W·H 동일 alpha). 0이면 l1_ratio만으로는 페널티 없음",
+    )
+    p.add_argument(
+        "--nmf-l1-ratio",
+        type=float,
+        default=0.65,
+        help="NMF에서 L1 비율(0~1). 클수록 희소·피크형 H에 가까워지기 쉬움(one-hot은 비보장)",
+    )
+    p.add_argument(
+        "--nmf-envelope-residual",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="NMF만: 입력을 max(raw−envelope_ref,0)로 두어 공통 형태 대비 특이 변동 위주(--no-nmf-envelope-residual=기존 raw 양수 클립)",
+    )
+    p.add_argument(
+        "--ref-envelope-pct-lo",
+        type=float,
+        default=10.0,
+        help="엔벨롭 참조: 피크형 λ(행 중앙값>국소 추세)에서 픽셀 축 이 하위 분위",
+    )
+    p.add_argument(
+        "--ref-envelope-pct-hi",
+        type=float,
+        default=90.0,
+        help="엔벨롭 참조: 골형 λ(행 중앙값<국소 추세)에서 픽셀 축 이 상위 분위",
+    )
+    p.add_argument(
+        "--ref-envelope-smooth-window",
+        type=int,
+        default=21,
+        help="엔벨롭: λ축 중앙값 이동평균 창(홀수로 보정, <3이면 엔벨롭=중앙값만)",
+    )
     args = p.parse_args()
     if args.prominence_spread_gamma <= 0.0:
         p.error("--prominence-spread-gamma must be > 0")
@@ -846,6 +1397,22 @@ def main() -> None:
         p.error("--robust-residual-prom-scale must be > 0")
     if args.viz_medium_prominence_frac < 0.0:
         p.error("--viz-medium-prominence-frac must be >= 0")
+    if args.ica_n_components < 0:
+        p.error("--ica-n-components must be >= 0")
+    if args.ica_max_iter < 1:
+        p.error("--ica-max-iter must be >= 1")
+    if args.nmf_alpha < 0.0:
+        p.error("--nmf-alpha must be >= 0")
+    if not 0.0 <= args.nmf_l1_ratio <= 1.0:
+        p.error("--nmf-l1-ratio must be in [0, 1]")
+    if not (
+        0.0 <= args.ref_envelope_pct_lo < args.ref_envelope_pct_hi <= 100.0
+    ):
+        p.error(
+            "--ref-envelope-pct-lo / --ref-envelope-pct-hi need 0 <= lo < hi <= 100"
+        )
+    if args.ref_envelope_smooth_window < 1:
+        p.error("--ref-envelope-smooth-window must be >= 1")
 
     txt = args.txt_path.resolve()
     out = (args.out if args.out is not None else Path(txt.stem)).resolve()
@@ -858,6 +1425,8 @@ def main() -> None:
         if args.no_progress:
             return it
         return tqdm(it, desc=desc, unit="px", mininterval=0.2)
+
+    write_pixel_pngs = bool(args.pixel_pngs)
 
     wl, y = load_cube(txt)
     n_wl = y.shape[0]
@@ -1101,6 +1670,28 @@ def main() -> None:
         args.viz_medium_prominence_frac,
     )
 
+    ica_meta: dict | None = None
+    if int(args.ica_n_components) > 0:
+        ica_meta = run_decomposition_on_cube(
+            y,
+            wl,
+            args.ica_n_components,
+            args.ica_method,
+            args.ica_random_state,
+            standardize=not args.ica_no_standardize,
+            out_dir=out,
+            max_iter=args.ica_max_iter,
+            x_index=bool(args.x_index),
+            linear_score_heatmap=bool(args.ica_linear_score_heatmap),
+            nmf_alpha=args.nmf_alpha,
+            nmf_l1_ratio=args.nmf_l1_ratio,
+            nmf_envelope_residual=bool(args.nmf_envelope_residual),
+            kmeans_normalize=args.spectral_kmeans_normalize,
+            ref_env_pct_lo=args.ref_envelope_pct_lo,
+            ref_env_pct_hi=args.ref_envelope_pct_hi,
+            ref_env_smooth_window=args.ref_envelope_smooth_window,
+        )
+
     meta = {
         "grid": GRID,
         "n_wavelength": int(n_wl),
@@ -1149,12 +1740,14 @@ def main() -> None:
         ),
         "pixels": per_pixel,
     }
+    if ica_meta is not None:
+        meta["ica"] = ica_meta
     write_meta(out / "meta.json", meta)
 
     tpl = Path(__file__).resolve().parent / "index_template.html"
     build_index_html(tpl, out / "index.html", meta, bin_path)
 
-    if not args.no_pixel_pngs:
+    if write_pixel_pngs:
         for j in pxiter("픽셀 PNG"):
             r, c = divmod(j, GRID)
             plot_pixel_figure(
@@ -1167,10 +1760,16 @@ def main() -> None:
                 modal_curve=modal_curve,
             )
 
-    extra = "" if args.no_pixel_pngs else ", pixels/*.png"
+    extra = ", pixels/*.png" if write_pixel_pngs else ""
+    ica_extra = ""
+    if ica_meta is not None:
+        ica_extra = (
+            f", heatmap_ica_component*_40x40.png ({ica_meta['n_components']} comps), "
+            "ica_mixing_*_scatter.png, ica_ref_*_scatter.png, ica_* .npy"
+        )
     print(
         f"Wrote: {out / 'index.html'} (embedded spectra), meta.json, spectra.bin, "
-        f"heatmap_*_40x40.png{extra}"
+        f"heatmap_*_40x40.png{extra}{ica_extra}"
     )
 
 

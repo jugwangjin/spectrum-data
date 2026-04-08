@@ -74,8 +74,10 @@
 - Chart.js 4(CDN): scatter(raw + LP) + line 화살표. **번들 채널 수**가 `1 + len(windows) + meta.spectra_viz_channels`와 일치하면 화살표는 **spectra.bin** 마지막 4채널에서만 읽음(clear 빨강/녹 + 중간 주황/청록). 예전 번들(채널 수 짧음)은 `pixels[].clear_maxima/minima`(meta) 폴백.
 - 픽셀 메타에 `valley_primary_nm`, `valley_width_nm` 추가(툴팁·팝업 제목).
 - **activation 격자 색**: `meta.heatmap_activation_log`, `heatmap_activation_pct_lo`, `heatmap_activation_pct_hi`를 읽어 PNG `heatmap_activation_40x40.png`와 같은 백분위·로그 규칙으로 `activations`를 스칼라→색으로 매핑(팔레트는 matplotlib `magma`와 다를 수 있으나 스케일은 동일). 예전 `meta`에 키가 없으면 로그 켜고 pct 2/98로 간주.
+- **세로 순서(요약)**: (1) activation (로그) (2) 스펙트럼 분해 블록(`meta.ica` 있을 때) (3) modal RMS (4) 주도 피크/골 **파장** (5) 소제목 «개수·폭·견고성» 아래 피크 개수·폭·골 폭·견고성·activation×persistence.
 - **추가 히트맵 격자**(PNG와 동일 데이터): `peak_wavelength_nm`, `peak_width_nm`, `valley_wavelength_nm`, `valley_width_nm`, `peak_count_roi` — 길이 `grid*grid`, `nan`은 JSON `null`. 브라우저에서 2–98 백분위 선형(또는 파장은 HSL)으로 색만 근사; 모든 격자에서 호버 시 동일 스펙트럼 팝업. 팝업 제목에 해당 픽셀의 맵 요약 한 줄 포함.
 - **견고성 격자**: `robust_peak_persistence_frac`, `robust_valley_persistence_frac`, `peak_count_roi_prev_smooth`, `peak_count_roi_residual`, `valley_count_roi_residual`, `activation_x_peak_persistence` — LP 한 단계뿐이거나 잔차 끄면 일부가 전부 `null`/어두운 격자.
+- **분해 블록**(옵션): `meta.ica`가 있으면 activation 바로 아래에 mixing 차트 + 성분별 픽셀 점수 격자 + 체크박스 토글(«스펙트럼 분해» 절).
 
 ## 주도 골(dominant valley) 맵
 
@@ -92,7 +94,29 @@
 ## 성능
 
 - `matplotlib` 백엔드는 `Agg` 고정.
-- 1600장 PNG는 수 분 단위일 수 있어 `--no-pixel-pngs` 로 본 분석/HTML만 빠르게 생성 가능.
+- 픽셀 PNG 1600장은 수 분 단위일 수 있어 **기본 비생성**; `--pixel-pngs`일 때만 `pixels/*.png` 작성.
+
+## 스펙트럼 분해 FastICA / NMF / K-means (기본: `--ica-n-components` 10, `--ica-method` kmeans; 0이면 생략)
+
+- **`--ica-method`**
+  - **kmeans (기본)**: `sklearn.cluster.KMeans`. 픽셀당 **정확히 한 성분에만 1**(exclusive one-hot), 나머지 0. 성분 곡선=**클러스터 중심**. 선형 혼합 `X≈WH`가 아니라 Voronoi 할당. `--spectral-kmeans-normalize` 기본 **`l2`**: 행 **L2 정규화 후** 군집(진폭보다 **형태** 위주); `none`이면 진폭 유지. 성분(클러스터)마다 픽셀이 **통상 ≥1개**(빈 클러스터는 드묻). «각 λ마다 한 성분만 켜지게» 같은 **파장축 one-hot**은 별도 모델(예: 엄격한 스파스 코딩·맞춤 제약)이 필요하고 본 파이프라인에는 없음.
+  - **nmf**: `sklearn.decomposition.NMF` — `X≈W·H`, **W,H ≥ 0**. 기본 입력은 **엔벨롭 참조 `env(λ)` 대비 양의 잔차** `X = max(y.T − env, 0)` 후 `max(·, 1e-12)`(공통 형태를 빼고 «특이» 돌출·피크 쪽에 NMF가 기울기 쉬움). `--no-nmf-envelope-residual`이면 예전처럼 **raw 양수 클립만**. 표준화 없음. `--nmf-alpha`, `--nmf-l1-ratio`로 L1/L2 페널티. `meta.ica.nmf_envelope_residual`.
+  - **fastica**: `sklearn.decomposition.FastICA` (`whiten="unit-variance"`). **음수** mixing·점수는 정상(부호·스케일 모호성: 성분과 mixing 열을 동시에 뒤집으면 동일 모델). 해석은 크기·상대 형태 위주.
+- **FastICA 전처리**: 기본 파장축 `StandardScaler` (`--ica-no-standardize`로 끔). NMF·K-means는 위 규칙대로 raw/정규화만.
+- **출력 해석**
+  - **FastICA**: `mixing_` **열** ≈ λ 패턴; `transform` 점수 = 픽셀별 축 강도. **고유값 없음**; 순위는 점수 **분산** 내림차순.
+  - **NMF**: `components_`의 행 = λ 패턴 H(≥0), `transform` = W(≥0).
+  - **K-means**: `meta.ica.cluster_sizes_ordered`, `ica_kmeans_labels_ordered.npy`, 점수 맵은 0/1.
+- **잘림**: `K = min(n_components, n_pixel, n_wl)`; `K < 1`이면 생략.
+- **mean / median / 엔벨롭 참조**: 모두 **원본 `y`**에서 만든 **비교용 곡선**(성분 아님).
+  - **엔벨롭**: 파장마다 픽셀 축 **중앙값** `med(λ)`을 λ축 이동평균으로 스무딩한 `baseline(λ)`과 비교. `med > baseline`이면 «피크형»으로 보고 그 λ에서 픽셀 축 **하위 분위**(`--ref-envelope-pct-lo`, 기본 10%); `med < baseline`이면 «골형»으로 **상위 분위**(`--ref-envelope-pct-hi`, 기본 90%); 같으면 중앙값. 창 `<3`이면 엔벨롭=중앙값만. 산출: `ica_ref_envelope_spectrum_scatter.png`, `ica_ref_envelope_spectrum_y.npy`, `ica_ref_envelope_peak_like.npy`, `meta.ica.envelope_ref_*`.
+- **픽셀 점수 히트맵·HTML**
+  - FastICA: 기본 **asinh** 대칭 스케일; `--ica-linear-score-heatmap`이면 대칭 선형(coolwarm).
+  - NMF: 기본 **log colorbar + magma**; `--ica-linear-score-heatmap`이면 선형 magma.
+  - K-means: **선형 magma**(0/1).
+- **mixing 대표 형상 PNG**: 성분마다 `ica_mixing_component{00..}_scatter.png`.
+- **파일**: `heatmap_ica_component{00..}_40x40.png`, scatter·ref PNG, `ica_* .npy`.
+- **meta / HTML**: `decomposition_backend`, `score_sign`, `ica_score_display`, NMF 시 `nmf_*`·`nmf_envelope_residual`, K-means 시 `kmeans_normalize`·`cluster_sizes_ordered`·`pixel_code`. 뷰어 **체크박스** 토글 동일.
 
 ## 소스
 
