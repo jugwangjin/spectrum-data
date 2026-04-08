@@ -111,21 +111,40 @@ def per_wavelength_cross_spread(y: np.ndarray, metric: str) -> np.ndarray:
     raise ValueError(f"spread metric: {metric!r} (use var, iqr, std, mad)")
 
 
+def _cross_spread_reference_level(spread_s: np.ndarray, kind: str) -> float:
+    """파장축으로 구한 spread 시퀀스에 대한 전역 기준(중앙값·분위수)."""
+    s = np.asarray(spread_s, dtype=np.float64)
+    s = s[np.isfinite(s)]
+    if s.size == 0:
+        return 1.0
+    if kind == "median":
+        return float(np.median(s))
+    if kind == "p75":
+        return float(np.percentile(s, 75.0))
+    if kind == "p90":
+        return float(np.percentile(s, 90.0))
+    raise ValueError(f"prominence spread ref: {kind!r} (use median, p75, p90)")
+
+
 def spread_to_prominence_curve(
     spread: np.ndarray,
     prominence_frac: float,
     mix_local: float,
     smooth_window: int,
     mode: str = "inverse",
+    inverse_gamma: float = 2.5,
+    inverse_ref: str = "median",
 ) -> tuple[np.ndarray, dict]:
     """
     파장별 cross-spread로 prominence 하한 곡선. 선택적 파장축 스무딩 후:
 
-    - inverse (기본): spread 큰 파장 → 하한 낮음(피크·골 잘 잡음), spread 작은 파장 → 하한 높음(억제).
-      shape = mix * (median(spread_s) / spread_s_safe) + (1-mix)*1, prom = prominence_frac * median * shape.
+    - inverse (기본): 전역 기준 대비 spread가 작은 파장은 하한을 **강하게** 올림.
+      ref = median 또는 p75/p90(전체 파장 spread 분포), safe = max(spread_s, ref*rho_floor),
+      shape_core = min((ref/safe)^gamma, cap), shape = mix*shape_core + (1-mix),
+      prom = prominence_frac * ref * shape. gamma>1이면 «전체보다 많이 낮은» 구간이 선형보다 훨씬 덜 민감.
     - direct (레거시): spread에 비례해 하한 — spread 큰 파장이 더 까다로움.
-    mix_local: inverse에서 1이면 파장별 대비가 최대, 0이면 전 파장 동일 하한(prominence_frac * median).
-    global_scale = median(spread_s) 는 파장별 spread 스칼라들의 중앙값.
+    mix_local: inverse에서 shape_core 비중(클수록 저분산 억제·고분산 완화 효과 강함).
+    global_cross_spread_median: 진단용 median(spread_s) (inverse의 ref와 다를 수 있음).
     smooth_window: 홀수 길이 이동평균(파장 방향), 0이면 끔.
     """
     spread = np.asarray(spread, dtype=np.float64)
@@ -144,15 +163,28 @@ def spread_to_prominence_curve(
     global_scale = float(np.median(spread_s))
     mix = float(np.clip(mix_local, 0.0, 1.0))
 
+    prom_inv_gamma: float | None = None
+    prom_inv_ref: str | None = None
+    prom_inv_ref_val: float | None = None
+
     if mode == "direct":
         spread_used = mix * spread_s + (1.0 - mix) * global_scale
         prom_vec = prominence_frac * spread_used
     elif mode == "inverse":
-        med = global_scale
-        safe = np.fmax(spread_s, med * 1e-4)
-        ratio = med / safe
-        shape = mix * ratio + (1.0 - mix) * 1.0
-        prom_vec = prominence_frac * med * shape
+        ref = _cross_spread_reference_level(spread_s, inverse_ref)
+        if not np.isfinite(ref) or ref <= 0.0:
+            ref = max(global_scale, 1e-12)
+        prom_inv_gamma = float(inverse_gamma)
+        prom_inv_ref = inverse_ref
+        prom_inv_ref_val = float(ref)
+        rho_floor = 1e-5
+        safe = np.fmax(spread_s, ref * rho_floor)
+        ratio = ref / safe
+        g = float(max(inverse_gamma, 1e-6))
+        shape_core = np.power(ratio, g)
+        shape_core = np.fmin(shape_core, 8000.0)
+        shape = mix * shape_core + (1.0 - mix) * 1.0
+        prom_vec = prominence_frac * ref * shape
     else:
         raise ValueError(f"spread vs prominence mode: {mode!r} (use inverse, direct)")
 
@@ -162,6 +194,9 @@ def spread_to_prominence_curve(
         "mix_local": mix,
         "smooth_window": w if w >= 3 else 0,
         "prominence_spread_mode": mode,
+        "prominence_inverse_gamma": prom_inv_gamma,
+        "prominence_inverse_ref": prom_inv_ref,
+        "prominence_inverse_ref_value": prom_inv_ref_val,
     }
     return prom_vec, info
 
@@ -449,13 +484,13 @@ def main() -> None:
     p.add_argument(
         "--prominence-frac",
         type=float,
-        default=0.012,
-        help="블렌딩된 effective spread에 곱해 prominence 하한 곡선을 만듦",
+        default=0.020,
+        help="블렌딩된 effective spread에 곱해 prominence 하한 곡선을 만듦 (클수록 덜 민감)",
     )
     p.add_argument(
         "--clear-prominence-factor",
         type=float,
-        default=1.5,
+        default=1.65,
         help="명확한 국소 최대/최소: 해당 파장 prominence 하한의 이 배수 이상",
     )
     p.add_argument(
@@ -468,8 +503,8 @@ def main() -> None:
     p.add_argument(
         "--spread-mix-local",
         type=float,
-        default=0.35,
-        help="0~1. 파장별 spread 비중; 나머지는 전 스펙트럼 median(spread) (작을수록 덜 민감)",
+        default=0.5,
+        help="0~1. inverse: shape_core=(ref/safe)^gamma 가중; 클수록 저분산 억제·고분산 완화가 강함. direct: 파장별/median 혼합",
     )
     p.add_argument(
         "--spread-smooth-window",
@@ -484,7 +519,25 @@ def main() -> None:
         default="inverse",
         help="inverse: cross-spread 큰 파장에서 피크·골 검출 우선(하한 낮음). direct: spread에 비례한 하한(이전 동작)",
     )
-    p.add_argument("--peak-distance", type=int, default=8)
+    p.add_argument(
+        "--prominence-spread-ref",
+        type=str,
+        choices=("median", "p75", "p90"),
+        default="p75",
+        help="inverse: 전 파장 spread 분포의 기준(중앙값·분위수). p75/p90일수록 «전체보다 낮은» 파장 억제 강함",
+    )
+    p.add_argument(
+        "--prominence-spread-gamma",
+        type=float,
+        default=2.5,
+        help="inverse: (ref/spread_safe)^gamma 에 쓰는 지수. 클수록 저 spread 파장 prominence 하한이 급격히 증가",
+    )
+    p.add_argument(
+        "--peak-distance",
+        type=int,
+        default=12,
+        help="인접 피크·골 최소 간격(샘플); 클수록 덜 촘촘히 검출",
+    )
     p.add_argument(
         "--x-index",
         action="store_true",
@@ -507,6 +560,8 @@ def main() -> None:
         help="파장별 최빈 진폭용 히스토그램 빈 개수",
     )
     args = p.parse_args()
+    if args.prominence_spread_gamma <= 0.0:
+        p.error("--prominence-spread-gamma must be > 0")
 
     txt = args.txt_path.resolve()
     out = (args.out if args.out is not None else Path(txt.stem)).resolve()
@@ -533,6 +588,8 @@ def main() -> None:
         args.spread_mix_local,
         args.spread_smooth_window,
         args.prominence_spread_mode,
+        args.prominence_spread_gamma,
+        args.prominence_spread_ref,
     )
     spread_used = prom_vec / max(args.prominence_frac, 1e-15)
     np.save(out / "per_wavelength_cross_spread.npy", cross_spread)
@@ -659,6 +716,9 @@ def main() -> None:
         "spread_mix_local": float(args.spread_mix_local),
         "spread_smooth_window": spread_info["smooth_window"],
         "prominence_spread_mode": spread_info["prominence_spread_mode"],
+        "prominence_inverse_gamma": spread_info["prominence_inverse_gamma"],
+        "prominence_inverse_ref": spread_info["prominence_inverse_ref"],
+        "prominence_inverse_ref_value": spread_info["prominence_inverse_ref_value"],
         "global_cross_spread_median": spread_info["global_cross_spread_median"],
         "clear_prominence_factor": float(args.clear_prominence_factor),
         "prominence_min_per_wavelength": prom_vec.astype(float).tolist(),
