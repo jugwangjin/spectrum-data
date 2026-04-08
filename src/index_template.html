@@ -16,6 +16,9 @@
       cursor: crosshair;
     }
     table.grid td:hover { outline: 2px solid #fff; z-index: 1; position: relative; }
+    .mapblock { margin-bottom: 1.25rem; }
+    .mapblock h2 { font-size: 0.95rem; margin: 0 0 6px; color: #ccc; font-weight: 600; }
+    .mapblock .sub { font-size: 0.75rem; color: #777; margin: 0 0 6px; max-width: 52rem; }
     #popup {
       display: none; position: fixed; right: 16px; top: 16px; width: min(520px, 92vw);
       background: #1a1a1a; border: 1px solid #444; border-radius: 8px;
@@ -27,12 +30,45 @@
   </style>
 </head>
 <body>
-  <h1>40×40 픽셀 — 아래 두 맵은 서로 다른 score / 호버 시 같은 팝업에 스펙트럼 + 최빈 곡선</h1>
+  <h1>40×40 픽셀 — 히트맵(activation·RMS·피크/골 맵) / 셀 호버 시 동일 스펙트럼 팝업</h1>
   <p class="hint" id="hint"></p>
-  <h2 style="font-size:0.95rem;margin:12px 0 6px;color:#ccc">ROI 피크·골 prominence score</h2>
-  <table class="grid" id="grid" aria-label="activation map"></table>
-  <h2 style="font-size:0.95rem;margin:16px 0 6px;color:#ccc">RMS vs 파장별 최빈 진폭 곡선 (전 픽셀 히스토그램 모드)</h2>
-  <table class="grid" id="gridModal" aria-label="modal deviation map"></table>
+
+  <div class="mapblock">
+    <h2 id="actMapTitle">ROI 피크·골 prominence score</h2>
+    <p class="sub">PNG <code>heatmap_activation_40x40.png</code>와 동일 백분위·로그 규칙(meta 키 참고).</p>
+    <table class="grid" id="grid" aria-label="activation map"></table>
+  </div>
+  <div class="mapblock">
+    <h2>RMS vs 파장별 최빈 진폭 (전 픽셀 히스토그램 모드)</h2>
+    <p class="sub">색: 유효값 2–98 백분위 선형 스케일(대략 inferno 계열).</p>
+    <table class="grid" id="gridModal" aria-label="modal deviation map"></table>
+  </div>
+  <div class="mapblock">
+    <h2>ROI 안 피크 개수 (스무딩 곡선 find_peaks)</h2>
+    <p class="sub"><code>heatmap_peak_count_roi_40x40.png</code></p>
+    <table class="grid" id="gridPeakCount" aria-label="peak count map"></table>
+  </div>
+  <div class="mapblock">
+    <h2>주도 피크 파장 (ROI, 최고 prominence)</h2>
+    <p class="sub"><code>heatmap_peak_wavelength_40x40.png</code> · 무효는 어두운 회색</p>
+    <table class="grid" id="gridPeakNm" aria-label="dominant peak wavelength"></table>
+  </div>
+  <div class="mapblock">
+    <h2>주도 피크 폭 FWHM @ 0.5 (스무딩)</h2>
+    <p class="sub"><code>heatmap_peak_width_40x40.png</code></p>
+    <table class="grid" id="gridPeakW" aria-label="dominant peak width"></table>
+  </div>
+  <div class="mapblock">
+    <h2>주도 골 파장 (ROI, 최고 prominence)</h2>
+    <p class="sub"><code>heatmap_valley_wavelength_40x40.png</code></p>
+    <table class="grid" id="gridValleyNm" aria-label="dominant valley wavelength"></table>
+  </div>
+  <div class="mapblock">
+    <h2>주도 골 폭 FWHM @ 0.5 (−스무딩)</h2>
+    <p class="sub"><code>heatmap_valley_width_40x40.png</code></p>
+    <table class="grid" id="gridValleyW" aria-label="dominant valley width"></table>
+  </div>
+
   <div id="popup">
     <h2 id="ptitle"></h2>
     <canvas id="ch" height="280"></canvas>
@@ -50,30 +86,119 @@
     const modalCurve = META.modal_amplitude_curve || [];
     const pixelsMeta = META.pixels;
     const xIsIndex = META.x_axis === "index";
+    const peakNmArr = META.peak_wavelength_nm || [];
+    const peakWArr = META.peak_width_nm || [];
+    const valleyNmArr = META.valley_wavelength_nm || [];
+    const valleyWArr = META.valley_width_nm || [];
+    const peakCountArr = META.peak_count_roi || [];
+
+    const HM_PCT_LO = 2;
+    const HM_PCT_HI = 98;
 
     function percentile(arr, p) {
-      const s = [...arr].sort((a,b) => a - b);
+      if (!arr.length) return 0;
+      const s = [...arr].sort((a, b) => a - b);
       const i = (p / 100) * (s.length - 1);
       const lo = Math.floor(i), hi = Math.ceil(i);
       return s[lo] + (i - lo) * (s[hi] - s[lo] || 0);
     }
-    const aLo = percentile(acts, 5), aHi = percentile(acts, 95);
-    function actColor(a) {
-      const t = Math.max(0, Math.min(1, (a - aLo) / (aHi - aLo || 1)));
-      const r = Math.round(255 * t);
-      const g = Math.round(255 * (1 - Math.abs(t - 0.5) * 2));
-      const b = Math.round(255 * (1 - t));
-      return `rgb(${r},${g},${b})`;
+
+    function finiteList(arr) {
+      return arr.filter((x) => x != null && Number.isFinite(x));
     }
 
-    const mLo = modalScores.length ? percentile(modalScores, 5) : 0;
-    const mHi = modalScores.length ? percentile(modalScores, 95) : 1;
+    const actLog = META.heatmap_activation_log !== false;
+    const actPctLo = META.heatmap_activation_pct_lo ?? 2;
+    const actPctHi = META.heatmap_activation_pct_hi ?? 98;
+    const actFinite = acts.filter((a) => Number.isFinite(a));
+    const posActs = actFinite.filter((a) => a > 0);
+    let aLo, aHi;
+    if (actLog && posActs.length) {
+      aLo = percentile(posActs, actPctLo);
+      aHi = percentile(actFinite, actPctHi);
+      aLo = Math.max(aLo, 1e-12);
+      if (aHi <= aLo) aHi = aLo * 10;
+    } else {
+      aLo = percentile(actFinite, actPctLo);
+      aHi = percentile(actFinite, actPctHi);
+      if (aHi <= aLo) aHi = aLo + 1e-9;
+    }
+    function actColorScalar(t) {
+      const u = Math.max(0, Math.min(1, t));
+      const r = Math.round(255 * u);
+      const g = Math.round(255 * (1 - Math.abs(u - 0.5) * 2));
+      const b = Math.round(255 * (1 - u));
+      return `rgb(${r},${g},${b})`;
+    }
+    function actColor(a) {
+      if (actLog && posActs.length) {
+        if (!(a > 0) || !Number.isFinite(a)) return "rgb(0,0,0)";
+        const la = Math.log(a);
+        const llo = Math.log(aLo);
+        const lhi = Math.log(aHi);
+        const t = (la - llo) / (lhi - llo || 1);
+        return actColorScalar(t);
+      }
+      const t = (a - aLo) / (aHi - aLo || 1);
+      return actColorScalar(t);
+    }
+    (function () {
+      const el = document.getElementById("actMapTitle");
+      if (!el) return;
+      if (actLog) el.textContent += " (로그 색 스케일, meta와 PNG 동일)";
+      else el.textContent += " (선형 색 스케일)";
+    })();
+
+    const mFin = finiteList(modalScores);
+    const mLo = mFin.length ? percentile(mFin, HM_PCT_LO) : 0;
+    const mHi = mFin.length ? percentile(mFin, HM_PCT_HI) : 1;
     function modalColor(v) {
+      if (v == null || !Number.isFinite(v)) return "#252525";
       const t = Math.max(0, Math.min(1, (v - mLo) / (mHi - mLo || 1)));
       const r = Math.round(255 * Math.min(1, t * 1.2));
       const g = Math.round(255 * (0.2 + 0.5 * (1 - t)));
       const b = Math.round(255 * (0.35 * (1 - t)));
       return `rgb(${r},${g},${b})`;
+    }
+
+    function wavelengthMapColor(nm, arr) {
+      const f = finiteList(arr);
+      if (nm == null || !Number.isFinite(nm) || !f.length) return "#252525";
+      const lo = percentile(f, HM_PCT_LO), hi = percentile(f, HM_PCT_HI);
+      const t = Math.max(0, Math.min(1, (nm - lo) / (hi - lo || 1)));
+      const h = 265 - 265 * t;
+      const L = 26 + 48 * t;
+      return `hsl(${h}, 78%, ${L}%)`;
+    }
+
+    function viridisT(t) {
+      const u = Math.max(0, Math.min(1, t));
+      const r = Math.round(68 + u * (253 - 68));
+      const g = Math.round(1 + u * (220 - 1));
+      const b = Math.round(84 + u * (50 - 84));
+      return `rgb(${r},${g},${b})`;
+    }
+    function plasmaT(t) {
+      const u = Math.max(0, Math.min(1, t));
+      const r = Math.round(13 + 220 * Math.pow(u, 0.95));
+      const g = Math.round(8 + 80 * u);
+      const b = Math.round(135 - 95 * u);
+      return `rgb(${r},${g},${b})`;
+    }
+    function cividisT(t) {
+      const u = Math.max(0, Math.min(1, t));
+      const r = Math.round(0 + 100 * u);
+      const g = Math.round(32 + 200 * u);
+      const b = Math.round(140 - 90 * u);
+      return `rgb(${r},${g},${b})`;
+    }
+
+    function metricLinearColor(v, arr, rgbAtT) {
+      const f = finiteList(arr);
+      if (v == null || !Number.isFinite(v) || !f.length) return "#252525";
+      const lo = percentile(f, HM_PCT_LO), hi = percentile(f, HM_PCT_HI);
+      const t = Math.max(0, Math.min(1, (v - lo) / (hi - lo || 1)));
+      return rgbAtT(t);
     }
 
     let bundleBuf = null;
@@ -104,6 +229,11 @@
 
     function xVal(i) {
       return xIsIndex ? (i + 1) : wl[i];
+    }
+
+    function fmt(x, d) {
+      if (x == null || !Number.isFinite(x)) return "—";
+      return Number(x).toFixed(d);
     }
 
     function showPopup(p) {
@@ -238,7 +368,9 @@
       extra += ` · ROI peaks=${np} valleys=${nv}`;
       const mr = pm.modal_rms;
       if (mr != null && Number.isFinite(mr)) extra += ` · modal RMS=${mr.toFixed(2)}`;
-      title.textContent = `pixel ${p} (row ${r}, col ${c}) · act score=${(pm.score||0).toFixed(1)}${extra}`;
+      let mapLine = "";
+      if (peakNmArr.length === G * G) mapLine += ` | maps: peakλ ${fmt(peakNmArr[p], 2)} w ${fmt(peakWArr[p], 2)} · vλ ${fmt(valleyNmArr[p], 2)} vw ${fmt(valleyWArr[p], 2)} · nPeak ${fmt(peakCountArr[p], 0)}`;
+      title.textContent = `pixel ${p} (row ${r}, col ${c}) · act score=${(pm.score||0).toFixed(1)}${extra}${mapLine}`;
 
       popup.style.display = "block";
       const ctx = document.getElementById("ch").getContext("2d");
@@ -268,6 +400,14 @@
       });
     }
 
+    function wireCell(td, p) {
+      td.dataset.p = String(p);
+      td.addEventListener("mouseenter", () => {
+        if (!bundleBuf) return;
+        showPopup(p);
+      });
+    }
+
     function buildTable() {
       const tbl = document.getElementById("grid");
       for (let r = 0; r < G; r++) {
@@ -282,11 +422,7 @@
           if (pm.valley_primary_nm != null) tip += ` · valley ${pm.valley_primary_nm.toFixed(1)}nm`;
           td.title = tip;
           td.style.background = actColor(acts[p]);
-          td.dataset.p = String(p);
-          td.addEventListener("mouseenter", () => {
-            if (!bundleBuf) return;
-            showPopup(p);
-          });
+          wireCell(td, p);
           tr.appendChild(td);
         }
         tbl.appendChild(tr);
@@ -302,13 +438,99 @@
           const p = r * G + c;
           const td = document.createElement("td");
           const v = modalScores[p];
-          td.title = `pixel ${p} · modal RMS ${v.toFixed(3)} (vs λ-wise mode)`;
+          td.title = `pixel ${p} · modal RMS ${fmt(v, 3)}`;
           td.style.background = modalColor(v);
-          td.dataset.p = String(p);
-          td.addEventListener("mouseenter", () => {
-            if (!bundleBuf) return;
-            showPopup(p);
-          });
+          wireCell(td, p);
+          tr.appendChild(td);
+        }
+        tbl.appendChild(tr);
+      }
+    }
+
+    function buildPeakCountTable() {
+      const tbl = document.getElementById("gridPeakCount");
+      if (!tbl || peakCountArr.length !== G * G) return;
+      for (let r = 0; r < G; r++) {
+        const tr = document.createElement("tr");
+        for (let c = 0; c < G; c++) {
+          const p = r * G + c;
+          const td = document.createElement("td");
+          const v = peakCountArr[p];
+          td.title = `pixel ${p} · ROI peak count ${fmt(v, 0)}`;
+          td.style.background = metricLinearColor(v, peakCountArr, cividisT);
+          wireCell(td, p);
+          tr.appendChild(td);
+        }
+        tbl.appendChild(tr);
+      }
+    }
+
+    function buildPeakNmTable() {
+      const tbl = document.getElementById("gridPeakNm");
+      if (!tbl || peakNmArr.length !== G * G) return;
+      for (let r = 0; r < G; r++) {
+        const tr = document.createElement("tr");
+        for (let c = 0; c < G; c++) {
+          const p = r * G + c;
+          const td = document.createElement("td");
+          const v = peakNmArr[p];
+          td.title = `pixel ${p} · dominant peak λ ${fmt(v, 2)} nm`;
+          td.style.background = wavelengthMapColor(v, peakNmArr);
+          wireCell(td, p);
+          tr.appendChild(td);
+        }
+        tbl.appendChild(tr);
+      }
+    }
+
+    function buildPeakWTable() {
+      const tbl = document.getElementById("gridPeakW");
+      if (!tbl || peakWArr.length !== G * G) return;
+      for (let r = 0; r < G; r++) {
+        const tr = document.createElement("tr");
+        for (let c = 0; c < G; c++) {
+          const p = r * G + c;
+          const td = document.createElement("td");
+          const v = peakWArr[p];
+          td.title = `pixel ${p} · peak width ${fmt(v, 2)} nm`;
+          td.style.background = metricLinearColor(v, peakWArr, plasmaT);
+          wireCell(td, p);
+          tr.appendChild(td);
+        }
+        tbl.appendChild(tr);
+      }
+    }
+
+    function buildValleyNmTable() {
+      const tbl = document.getElementById("gridValleyNm");
+      if (!tbl || valleyNmArr.length !== G * G) return;
+      for (let r = 0; r < G; r++) {
+        const tr = document.createElement("tr");
+        for (let c = 0; c < G; c++) {
+          const p = r * G + c;
+          const td = document.createElement("td");
+          const v = valleyNmArr[p];
+          td.title = `pixel ${p} · dominant valley λ ${fmt(v, 2)} nm`;
+          td.style.background = wavelengthMapColor(v, valleyNmArr);
+          wireCell(td, p);
+          tr.appendChild(td);
+        }
+        tbl.appendChild(tr);
+      }
+    }
+
+    function buildValleyWTable() {
+      const tbl = document.getElementById("gridValleyW");
+      if (!tbl || valleyWArr.length !== G * G) return;
+      for (let r = 0; r < G; r++) {
+        const tr = document.createElement("tr");
+        for (let c = 0; c < G; c++) {
+          const p = r * G + c;
+          const td = document.createElement("td");
+          const v = valleyWArr[p];
+          td.title = `pixel ${p} · valley width ${fmt(v, 2)} nm`;
+          td.style.background = metricLinearColor(v, valleyWArr, viridisT);
+          wireCell(td, p);
           tr.appendChild(td);
         }
         tbl.appendChild(tr);
@@ -322,18 +544,27 @@
       const blob = new Blob([comp]);
       bundleBuf = await new Response(blob.stream().pipeThrough(ds)).arrayBuffer();
       document.getElementById("hint").textContent =
-        "같은 폴더의 index.html만 열면 됩니다 (스펙트럼은 이 페이지에 포함). 셀에 마우스를 올리면 그래프가 뜹니다.";
+        "같은 폴더의 index.html만 열면 됩니다 (스펙트럼은 이 페이지에 포함). 모든 격자에서 셀에 마우스를 올리면 같은 스펙트럼 팝업이 뜹니다. ROI " +
+        (META.roi_lo != null && META.roi_hi != null ? `${META.roi_lo}–${META.roi_hi} nm` : "") +
+        ". 예전 meta(맵 배열 없음)로 만든 HTML이면 파이프라인을 다시 실행하세요.";
     }
 
     document.getElementById("hint").textContent = "스펙트럼 번들 복원 중…";
-    loadEmbeddedBundle().then(() => {
+    function buildAllGrids() {
       buildTable();
       buildModalTable();
+      buildPeakCountTable();
+      buildPeakNmTable();
+      buildPeakWTable();
+      buildValleyNmTable();
+      buildValleyWTable();
+    }
+    loadEmbeddedBundle().then(() => {
+      buildAllGrids();
     }).catch(() => {
       document.getElementById("hint").textContent =
         "임베드 데이터 복원 실패 (브라우저가 DecompressionStream gzip을 지원하는지 확인).";
-      buildTable();
-      buildModalTable();
+      buildAllGrids();
     });
   </script>
 </body>

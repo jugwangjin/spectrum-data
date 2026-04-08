@@ -18,6 +18,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 import numpy as np
 from scipy.ndimage import uniform_filter1d
 from scipy.signal import find_peaks, peak_widths, savgol_filter
@@ -334,6 +335,16 @@ def write_meta(path: Path, meta: dict) -> None:
     path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
+def _pixel_map_for_json(a: np.ndarray) -> list[float | None]:
+    """길이 N_PIXEL 1D 배열을 meta.json용으로 직렬화(nan → null, JSON 표준 호환)."""
+    a = np.asarray(a, dtype=np.float64).ravel()
+    out: list[float | None] = []
+    for x in a:
+        xf = float(x)
+        out.append(None if np.isnan(xf) else xf)
+    return out
+
+
 def plot_pixel_figure(
     wl: np.ndarray,
     y_raw: np.ndarray,
@@ -437,18 +448,53 @@ def save_heatmap_colorbar(
     title: str,
     cbar_label: str,
     cmap: str,
+    *,
+    percentile_lo: float = 2.0,
+    percentile_hi: float = 98.0,
+    log_scale: bool = False,
 ) -> None:
-    """data shape (40, 40); NaN masked. Colorbar scaled to finite percentiles."""
+    """data shape (40, 40); NaN masked. Colorbar: linear percentiles or optional log (양수만)."""
     z = np.ma.masked_invalid(data.astype(np.float64))
     finite = z.compressed()
+    fig, ax = plt.subplots(figsize=(5.2, 4.4), dpi=150, layout="constrained")
     if finite.size == 0:
         lo, hi = 0.0, 1.0
+        im = ax.imshow(
+            z, origin="upper", interpolation="nearest", cmap=cmap, vmin=lo, vmax=hi
+        )
+    elif log_scale:
+        z_plot = np.ma.masked_where(z <= 0.0, z)
+        pos = z_plot.compressed()
+        if pos.size == 0:
+            lo, hi = 1e-12, 1.0
+            im = ax.imshow(
+                z_plot,
+                origin="upper",
+                interpolation="nearest",
+                cmap=cmap,
+                norm=LogNorm(vmin=lo, vmax=hi),
+            )
+        else:
+            lo = float(np.percentile(pos, percentile_lo))
+            hi = float(np.percentile(finite, percentile_hi))
+            lo = max(lo, 1e-12)
+            if hi <= lo:
+                hi = lo * 10.0
+            im = ax.imshow(
+                z_plot,
+                origin="upper",
+                interpolation="nearest",
+                cmap=cmap,
+                norm=LogNorm(vmin=lo, vmax=hi),
+            )
     else:
-        lo, hi = np.percentile(finite, 2), np.percentile(finite, 98)
+        lo = float(np.percentile(finite, percentile_lo))
+        hi = float(np.percentile(finite, percentile_hi))
         if hi <= lo:
             hi = lo + 1e-9
-    fig, ax = plt.subplots(figsize=(5.2, 4.4), dpi=150, layout="constrained")
-    im = ax.imshow(z, origin="upper", interpolation="nearest", cmap=cmap, vmin=lo, vmax=hi)
+        im = ax.imshow(
+            z, origin="upper", interpolation="nearest", cmap=cmap, vmin=lo, vmax=hi
+        )
     ax.set_title(title)
     ax.set_xlabel("col")
     ax.set_ylabel("row")
@@ -539,6 +585,24 @@ def main() -> None:
         help="인접 피크·골 최소 간격(샘플); 클수록 덜 촘촘히 검출",
     )
     p.add_argument(
+        "--heatmap-activation-pct-lo",
+        type=float,
+        default=2.0,
+        help="activation 히트맵 색 vmin 백분위. 로그 모드에서는 양수 점수만으로 하한 계산",
+    )
+    p.add_argument(
+        "--heatmap-activation-pct-hi",
+        type=float,
+        default=98.0,
+        help="activation 히트맵 색 vmax 백분위. 소수 초고점수 픽셀만 있으면 98이어도 나머지가 거의 검게 보일 수 있음→ 90~95 권장",
+    )
+    p.add_argument(
+        "--heatmap-activation-log",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="activation 히트맵 colorbar: 기본 로그. 선형은 --no-heatmap-activation-log",
+    )
+    p.add_argument(
         "--x-index",
         action="store_true",
         help="use 1..N for plot x instead of wavelength",
@@ -623,12 +687,18 @@ def main() -> None:
         per_pixel.append(feat)
 
     act_map = activations.reshape(GRID, GRID)
+    act_ht_title = "activation (ROI peak+valley prominence score)"
+    if args.heatmap_activation_log:
+        act_ht_title += " [log color scale]"
     save_heatmap_colorbar(
         act_map,
         out / "heatmap_activation_40x40.png",
-        "activation (ROI peak+valley prominence score)",
+        act_ht_title,
         "score (a.u.)",
         "magma",
+        percentile_lo=args.heatmap_activation_pct_lo,
+        percentile_hi=args.heatmap_activation_pct_hi,
+        log_scale=args.heatmap_activation_log,
     )
 
     save_heatmap_colorbar(
@@ -726,8 +796,16 @@ def main() -> None:
         "x_axis": "index" if args.x_index else "wavelength",
         "wavelength": wl.astype(float).tolist(),
         "activations": activations.astype(float).tolist(),
+        "heatmap_activation_log": bool(args.heatmap_activation_log),
+        "heatmap_activation_pct_lo": float(args.heatmap_activation_pct_lo),
+        "heatmap_activation_pct_hi": float(args.heatmap_activation_pct_hi),
         "modal_amplitude_curve": modal_curve.astype(float).tolist(),
         "modal_deviation_scores": modal_rms.astype(float).tolist(),
+        "peak_wavelength_nm": _pixel_map_for_json(peak_nm),
+        "peak_width_nm": _pixel_map_for_json(peak_w_nm),
+        "valley_wavelength_nm": _pixel_map_for_json(valley_nm),
+        "valley_width_nm": _pixel_map_for_json(valley_w_nm),
+        "peak_count_roi": [float(x) for x in peak_count.tolist()],
         "pixels": per_pixel,
     }
     write_meta(out / "meta.json", meta)
