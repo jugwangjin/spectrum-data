@@ -33,7 +33,7 @@
   </style>
 </head>
 <body>
-  <h1>40×40 픽셀 — 히트맵(activation · 스펙트럼 분해 · RMS · 파장 · 기타) / 호버 시 스펙트럼 팝업</h1>
+  <h1>40×40 픽셀 — 히트맵(activation · 스펙트럼 분해(기본 K-means) · RMS · 파장 · 기타) / 호버 시 스펙트럼 팝업</h1>
   <p class="hint" id="hint"></p>
 
   <div class="mapblock">
@@ -306,8 +306,26 @@
     }
 
     let bundleBuf = null;
-    let icaMixingChart = null;
+    const icaCharts = {};
     let chartInst = null;
+
+    const ICA_UI = {
+      block: "icaBlock",
+      title: "icaTitle",
+      toggleMixing: "icaToggleMixing",
+      toggleVar: "icaToggleVar",
+      toggleMeta: "icaToggleMeta",
+      toggleNote: "icaToggleNote",
+      toggleGrid: "icaToggleGrid",
+      sub: "icaSub",
+      note: "icaNote",
+      mixingWrap: "icaMixingWrap",
+      chart: "icaMixingChart",
+      varLine: "icaVarLine",
+      gridWrap: "icaGridWrap",
+      compSel: "icaCompSel",
+      grid: "gridIca",
+    };
 
     function pixelOffset(p) {
       const u32 = new Uint32Array(bundleBuf, 0, 4);
@@ -835,17 +853,17 @@
       return plasmaT(Math.max(0, Math.min(1, t)));
     }
 
-    function wireIcaToggles() {
-      const wrapM = document.getElementById("icaMixingWrap");
-      const wrapG = document.getElementById("icaGridWrap");
-      const vLine = document.getElementById("icaVarLine");
-      const sub = document.getElementById("icaSub");
-      const note = document.getElementById("icaNote");
-      const cm = document.getElementById("icaToggleMixing");
-      const cv = document.getElementById("icaToggleVar");
-      const cmeta = document.getElementById("icaToggleMeta");
-      const cnote = document.getElementById("icaToggleNote");
-      const cgrid = document.getElementById("icaToggleGrid");
+    function wireIcaToggles(ids) {
+      const wrapM = document.getElementById(ids.mixingWrap);
+      const wrapG = document.getElementById(ids.gridWrap);
+      const vLine = document.getElementById(ids.varLine);
+      const sub = document.getElementById(ids.sub);
+      const note = document.getElementById(ids.note);
+      const cm = document.getElementById(ids.toggleMixing);
+      const cv = document.getElementById(ids.toggleVar);
+      const cmeta = document.getElementById(ids.toggleMeta);
+      const cnote = document.getElementById(ids.toggleNote);
+      const cgrid = document.getElementById(ids.toggleGrid);
       if (!cm || !wrapM) return;
       function sync() {
         wrapM.style.display = cm.checked ? "block" : "none";
@@ -860,10 +878,9 @@
       sync();
     }
 
-    function buildIcaUi() {
-      const block = document.getElementById("icaBlock");
-      if (!block || !META.ica || !META.ica.mixing_columns_ordered) return;
-      const ic = META.ica;
+    function buildIcaUi(ic, ids) {
+      const block = document.getElementById(ids.block);
+      if (!block || !ic || !ic.mixing_columns_ordered) return;
       const mixing = ic.mixing_columns_ordered;
       const scores = ic.pixel_scores_ordered;
       const vars = ic.score_variance_per_component_ordered || [];
@@ -872,7 +889,7 @@
           ? ic.wavelength
           : wl;
       const K = mixing.length;
-      const titleEl = document.getElementById("icaTitle");
+      const titleEl = document.getElementById(ids.title);
       if (titleEl) {
         titleEl.textContent =
           (ic.method || "분해") + " — mixing(파장) · 픽셀 점수";
@@ -884,15 +901,15 @@
         mixing[0].length !== wlIca.length
       ) {
         block.style.display = "block";
-        const sub = document.getElementById("icaSub");
-        const note = document.getElementById("icaNote");
+        const sub = document.getElementById(ids.sub);
+        const note = document.getElementById(ids.note);
         if (sub) sub.textContent = "ICA meta 형식 불일치 (mixing 길이·wavelength)";
         if (note) note.textContent = "";
         return;
       }
       block.style.display = "block";
-      const subEl = document.getElementById("icaSub");
-      const noteEl = document.getElementById("icaNote");
+      const subEl = document.getElementById(ids.sub);
+      const noteEl = document.getElementById(ids.note);
       if (noteEl) noteEl.textContent = ic.note || "";
       if (subEl) {
         const sd = ic.ica_score_display || {};
@@ -913,11 +930,20 @@
           methodBits = ` · kmeans ${ic.kmeans_normalize || "none"}`;
           if (ic.cluster_sizes_ordered && ic.cluster_sizes_ordered.length)
             methodBits += ` · sizes ${ic.cluster_sizes_ordered.join("/")}`;
+        } else if (ic.decomposition_backend === "ae_softmax") {
+          methodBits = " · AE";
         }
+        const tagt = ic.ica_file_tag;
+        const hmGlob = tagt
+          ? `heatmap_ica_${tagt}_component*_40x40.png`
+          : `heatmap_ica_component*_40x40.png`;
+        const mxGlob = tagt
+          ? `ica_${tagt}_mixing_*_scatter.png`
+          : `ica_mixing_*_scatter.png`;
         subEl.innerHTML =
-          `<code>heatmap_ica_component*_40x40.png</code> · <code>ica_mixing_*_scatter.png</code> · <code>ica_ref_mean/median/envelope_spectrum_scatter.png</code> · 성분 ${K}개 · ${viz} · 파장축 표준화 ${ic.standardize_features ? "ON" : "OFF"}${methodBits}`;
+          `<code>${hmGlob}</code> · <code>${mxGlob}</code> · <code>ica_ref_mean/median/envelope_spectrum_scatter.png</code> · 성분 ${K}개 · ${viz} · 파장축 표준화 ${ic.standardize_features ? "ON" : "OFF"}${methodBits}`;
       }
-      const varLine = document.getElementById("icaVarLine");
+      const varLine = document.getElementById(ids.varLine);
       if (
         varLine &&
         ic.decomposition_backend === "kmeans" &&
@@ -933,7 +959,7 @@
           vars.map((v, i) => `C${i + 1}: ${Number(v).toExponential(3)}`).join(" · ");
       } else if (varLine) varLine.textContent = "";
 
-      const sel = document.getElementById("icaCompSel");
+      const sel = document.getElementById(ids.compSel);
       sel.innerHTML = "";
       for (let k = 0; k < K; k++) {
         const o = document.createElement("option");
@@ -954,7 +980,7 @@
         const s = scores[comp];
         const sd = ic.ica_score_display || {};
         const dispMode = sd.mode || "linear";
-        const tbl = document.getElementById("gridIca");
+        const tbl = document.getElementById(ids.grid);
         tbl.textContent = "";
         if (dispMode === "nonnegative_log" || dispMode === "nonnegative_linear") {
           for (let r = 0; r < G; r++) {
@@ -1021,14 +1047,14 @@
       sel.onchange = () => paintIcaGrid(Number(sel.value));
       paintIcaGrid(0);
 
-      wireIcaToggles();
+      wireIcaToggles(ids);
 
       if (typeof Chart === "undefined") return;
-      const canvas = document.getElementById("icaMixingChart");
+      const canvas = document.getElementById(ids.chart);
       if (!canvas) return;
-      if (icaMixingChart) {
-        icaMixingChart.destroy();
-        icaMixingChart = null;
+      if (icaCharts[ids.chart]) {
+        icaCharts[ids.chart].destroy();
+        icaCharts[ids.chart] = null;
       }
       const xs = xIsIndex
         ? mixing[0].map((_, i) => i + 1)
@@ -1038,7 +1064,9 @@
           ? "H (≥0)"
           : ic.decomposition_backend === "kmeans"
             ? "center"
-            : "mixing";
+            : ic.decomposition_backend === "ae_softmax"
+              ? "decode basis"
+              : "mixing";
       const chartTitle =
         ic.decomposition_backend === "nmf"
           ? ic.nmf_envelope_residual
@@ -1046,7 +1074,9 @@
             : "H 행 — λ별 비음수 패턴 (성분별)"
           : ic.decomposition_backend === "kmeans"
             ? "클러스터 중심 스펙트럼 (성분별)"
-            : "Mixing 열 — λ별 패턴 (성분별)";
+            : ic.decomposition_backend === "ae_softmax"
+              ? "AE decode(one_hot) 기준 λ 패턴 (성분별)"
+              : "Mixing 열 — λ별 패턴 (성분별)";
       const datasets = mixing.map((col, k) => ({
         label: `C${k + 1}`,
         data: col.map((yv, i) => ({ x: xs[i], y: yv })),
@@ -1056,7 +1086,7 @@
         borderWidth: 1.4,
         tension: 0.05,
       }));
-      icaMixingChart = new Chart(canvas.getContext("2d"), {
+      icaCharts[ids.chart] = new Chart(canvas.getContext("2d"), {
         type: "line",
         data: { datasets },
         options: {
@@ -1122,7 +1152,7 @@
       buildPeakResidualTable();
       buildValleyResidualTable();
       buildActXPersistTable();
-      buildIcaUi();
+      if (META.ica) buildIcaUi(META.ica, ICA_UI);
     }
     loadEmbeddedBundle().then(() => {
       buildAllGrids();

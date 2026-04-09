@@ -2,7 +2,7 @@
 40x40 (1600) spectral cube: tab-separated rows = wavelength samples, col0 = λ (nm), cols 1..1600 = amplitude.
 
 Outputs under --out (기본: 입력 txt의 stem 디렉터리): index.html (스펙트럼 gzip+base64 임베드, 로컬 서버 불필요),
-heatmaps + colorbars, meta.json, spectra.bin, 스펙트럼 분해 산출물(기본 K-means·L2·성분 10); 픽셀 PNG는 `--pixel-pngs`일 때만.
+heatmaps + colorbars, meta.json, spectra.bin, 스펙트럼 분해(기본 K-means·L2·성분 수); 픽셀 PNG는 `--pixel-pngs`일 때만. PyTorch AE는 참고용으로만 `src/deprecated/spectrum_autoencoder.py`에 보관(메인 파이프라인에서 미사용·미import).
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import gzip
 import json
 import struct
 from pathlib import Path
+from types import SimpleNamespace
 
 import matplotlib
 
@@ -636,8 +637,10 @@ def save_heatmap_colorbar(
     percentile_lo: float = 2.0,
     percentile_hi: float = 98.0,
     log_scale: bool = False,
+    vmin: float | None = None,
+    vmax: float | None = None,
 ) -> None:
-    """data shape (40, 40); NaN masked. Colorbar: linear percentiles or optional log (양수만)."""
+    """data shape (40, 40); NaN masked. vmin·vmax가 둘 다 주어지고 log_scale이 아니면 백분위 대신 고정 스케일."""
     z = np.ma.masked_invalid(data.astype(np.float64))
     finite = z.compressed()
     fig, ax = plt.subplots(figsize=(5.2, 4.4), dpi=150, layout="constrained")
@@ -672,10 +675,15 @@ def save_heatmap_colorbar(
                 norm=LogNorm(vmin=lo, vmax=hi),
             )
     else:
-        lo = float(np.percentile(finite, percentile_lo))
-        hi = float(np.percentile(finite, percentile_hi))
-        if hi <= lo:
-            hi = lo + 1e-9
+        if vmin is not None and vmax is not None:
+            lo, hi = float(vmin), float(vmax)
+            if hi <= lo:
+                hi = lo + 1e-9
+        else:
+            lo = float(np.percentile(finite, percentile_lo))
+            hi = float(np.percentile(finite, percentile_hi))
+            if hi <= lo:
+                hi = lo + 1e-9
         im = ax.imshow(
             z, origin="upper", interpolation="nearest", cmap=cmap, vmin=lo, vmax=hi
         )
@@ -819,6 +827,26 @@ def compute_envelope_reference_spectrum(
     return ref.astype(np.float64), peak_like
 
 
+def _ica_paths(out_dir: Path) -> SimpleNamespace:
+    """스펙트럼 분해 산출 PNG/NPY 경로 (고정 파일명)."""
+    od = Path(out_dir)
+
+    def heatmap(comp: int) -> Path:
+        return od / f"heatmap_ica_component{comp:02d}_40x40.png"
+
+    def mix_scatter(comp: int) -> Path:
+        return od / f"ica_mixing_component{comp:02d}_scatter.png"
+
+    def npy_path(stem: str) -> Path:
+        return od / f"ica_{stem}.npy"
+
+    return SimpleNamespace(
+        heatmap=heatmap,
+        mix_scatter=mix_scatter,
+        npy=npy_path,
+    )
+
+
 def run_decomposition_on_cube(
     y: np.ndarray,
     wl: np.ndarray,
@@ -857,6 +885,7 @@ def run_decomposition_on_cube(
     K = min(int(n_components), n_pix, n_wl)
     if K < 1:
         return None
+    tp = _ica_paths(out_dir)
     mean_y = np.mean(y, axis=1)
     median_y = np.median(y, axis=1)
     save_ica_spectrum_scatter(
@@ -956,7 +985,7 @@ def run_decomposition_on_cube(
             hmap = S_ord[:, k].reshape(GRID, GRID)
             save_heatmap_colorbar(
                 hmap,
-                out_dir / f"heatmap_ica_component{k:02d}_40x40.png",
+                tp.heatmap(k),
                 f"NMF component {k + 1} (rank {k + 1} by W variance)",
                 score_cbar,
                 "magma",
@@ -968,15 +997,15 @@ def run_decomposition_on_cube(
             save_ica_spectrum_scatter(
                 wl,
                 M_ord[:, k],
-                out_dir / f"ica_mixing_component{k:02d}_scatter.png",
+                tp.mix_scatter(k),
                 f"NMF H ({h_sub}) {k + 1} · rank {k + 1} by W variance",
                 mixing_ylabel,
                 x_index,
             )
-        np.save(out_dir / "ica_mixing_ordered.npy", M_ord)
-        np.save(out_dir / "ica_sources_ordered.npy", S_ord)
-        np.save(out_dir / "ica_mixing.npy", M)
-        np.save(out_dir / "ica_sources.npy", S)
+        np.save(tp.npy("mixing_ordered"), M_ord)
+        np.save(tp.npy("sources_ordered"), S_ord)
+        np.save(tp.npy("mixing"), M)
+        np.save(tp.npy("sources"), S)
         wl_list = wl.astype(float).tolist()
         mixing_list = [M_ord[:, k].astype(float).tolist() for k in range(K)]
         scores_list = [S_ord[:, k].astype(float).tolist() for k in range(K)]
@@ -1045,7 +1074,7 @@ def run_decomposition_on_cube(
             hmap = S_ord[:, k].reshape(GRID, GRID)
             save_heatmap_colorbar(
                 hmap,
-                out_dir / f"heatmap_ica_component{k:02d}_40x40.png",
+                tp.heatmap(k),
                 f"K-means cluster {k + 1} (rank {k + 1} by size)",
                 score_cbar,
                 "magma",
@@ -1056,16 +1085,16 @@ def run_decomposition_on_cube(
             save_ica_spectrum_scatter(
                 wl,
                 M_ord[:, k],
-                out_dir / f"ica_mixing_component{k:02d}_scatter.png",
+                tp.mix_scatter(k),
                 f"K-means center {k + 1} · rank {k + 1} by cluster size",
                 mixing_ylabel,
                 x_index,
             )
-        np.save(out_dir / "ica_mixing_ordered.npy", M_ord)
-        np.save(out_dir / "ica_sources_ordered.npy", S_ord)
-        np.save(out_dir / "ica_mixing.npy", M)
-        np.save(out_dir / "ica_sources.npy", S)
-        np.save(out_dir / "ica_kmeans_labels_ordered.npy", labels_ord)
+        np.save(tp.npy("mixing_ordered"), M_ord)
+        np.save(tp.npy("sources_ordered"), S_ord)
+        np.save(tp.npy("mixing"), M)
+        np.save(tp.npy("sources"), S)
+        np.save(tp.npy("kmeans_labels_ordered"), labels_ord)
         wl_list = wl.astype(float).tolist()
         mixing_list = [M_ord[:, k].astype(float).tolist() for k in range(K)]
         scores_list = [S_ord[:, k].astype(float).tolist() for k in range(K)]
@@ -1117,7 +1146,7 @@ def run_decomposition_on_cube(
         hmap = S_ord[:, k].reshape(GRID, GRID)
         save_heatmap_ica_scores(
             hmap,
-            out_dir / f"heatmap_ica_component{k:02d}_40x40.png",
+            tp.heatmap(k),
             f"FastICA component {k + 1} (rank {k + 1} by score variance)",
             "source score",
             linear=linear_score_heatmap,
@@ -1126,15 +1155,15 @@ def run_decomposition_on_cube(
         save_ica_spectrum_scatter(
             wl,
             M_ord[:, k],
-            out_dir / f"ica_mixing_component{k:02d}_scatter.png",
+            tp.mix_scatter(k),
             f"FastICA mixing column {k + 1} (λ-shape · rank {k + 1} by score variance)",
             "mixing weight",
             x_index,
         )
-    np.save(out_dir / "ica_mixing_ordered.npy", M_ord)
-    np.save(out_dir / "ica_sources_ordered.npy", S_ord)
-    np.save(out_dir / "ica_mixing.npy", M)
-    np.save(out_dir / "ica_sources.npy", S)
+    np.save(tp.npy("mixing_ordered"), M_ord)
+    np.save(tp.npy("sources_ordered"), S_ord)
+    np.save(tp.npy("mixing"), M)
+    np.save(tp.npy("sources"), S)
     wl_list = wl.astype(float).tolist()
     mixing_list = [M_ord[:, k].astype(float).tolist() for k in range(K)]
     scores_list = [S_ord[:, k].astype(float).tolist() for k in range(K)]
@@ -1154,7 +1183,7 @@ def run_decomposition_on_cube(
         "note": (
             "ICA는 PCA처럼 고유값이 없음. score_variance는 픽셀 간 분산(에너지) 프록시. "
             "mixing 열은 λ별 패턴. 음수는 부호·스케일 모호성(성분·mixing 동시 뒤집기와 동치)이라 "
-            "해석은 크기·상대형태 위주. 비음수 혼합(NMF)은 --ica-method nmf. 기본 분해는 kmeans. "
+            "해석은 크기·상대형태 위주. 비음수 혼합(NMF)은 --ica-method nmf. "
             "mean/median/엔벨롭 참조는 성분이 아니라 큐브 요약(비교용)."
         ),
     }
@@ -1343,7 +1372,7 @@ def main() -> None:
         type=str,
         choices=("fastica", "nmf", "kmeans"),
         default="kmeans",
-        help="kmeans(기본): 픽셀당 one-hot 클러스터. nmf: 비음수 W·H. fastica: 부호 ICA",
+        help="스펙트럼 분해 방법(PyTorch AE는 메인 파이프라인에서 제외; `src/deprecated/spectrum_autoencoder.py` 참고)",
     )
     p.add_argument(
         "--spectral-kmeans-normalize",
@@ -1413,7 +1442,6 @@ def main() -> None:
         )
     if args.ref_envelope_smooth_window < 1:
         p.error("--ref-envelope-smooth-window must be >= 1")
-
     txt = args.txt_path.resolve()
     out = (args.out if args.out is not None else Path(txt.stem)).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -1673,11 +1701,10 @@ def main() -> None:
     ica_meta: dict | None = None
     if int(args.ica_n_components) > 0:
         ica_meta = run_decomposition_on_cube(
-            y,
-            wl,
-            args.ica_n_components,
-            args.ica_method,
-            args.ica_random_state,
+            y=y,
+            wl=wl,
+            n_components=args.ica_n_components,
+            random_state=args.ica_random_state,
             standardize=not args.ica_no_standardize,
             out_dir=out,
             max_iter=args.ica_max_iter,
@@ -1690,6 +1717,7 @@ def main() -> None:
             ref_env_pct_lo=args.ref_envelope_pct_lo,
             ref_env_pct_hi=args.ref_envelope_pct_hi,
             ref_env_smooth_window=args.ref_envelope_smooth_window,
+            method=args.ica_method,
         )
 
     meta = {
@@ -1764,8 +1792,8 @@ def main() -> None:
     ica_extra = ""
     if ica_meta is not None:
         ica_extra = (
-            f", heatmap_ica_component*_40x40.png ({ica_meta['n_components']} comps), "
-            "ica_mixing_*_scatter.png, ica_ref_*_scatter.png, ica_* .npy"
+            f", heatmap_ica_*_40x40.png ({ica_meta['n_components']} comps), "
+            "ica_*mixing*scatter.png, ica_ref_*_scatter.png, ica_* .npy"
         )
     print(
         f"Wrote: {out / 'index.html'} (embedded spectra), meta.json, spectra.bin, "
